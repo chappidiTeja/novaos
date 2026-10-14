@@ -19,7 +19,8 @@ pub fn handle_interrupt() {
             let table = if SHIFT.load(Ordering::Relaxed) { SHIFTED } else { NORMAL };
             if let Some(&c) = table.get(code as usize) {
                 if c != 0 {
-                    crate::ipc::console::push_input(c);
+                    // To the desktop if one owns the input, otherwise to stdin.
+                    crate::input::key(c);
                 }
             }
         }

@@ -2,18 +2,19 @@ LIMINE   ?= $(HOME)/os/limine
 KERNEL   := target/x86_64-unknown-none/release/kernel
 ISO      := novaos.iso
 TEST_ISO := novaos-test.iso
+DESKTOP_ISO := novaos-desktop.iso
 
 USER_OUT  := user/target/x86_64-unknown-none/release
 USER_ELF  := build/hello.elf
 # Programs that go to /bin on the disk. `hello` is also embedded in the kernel for its tests.
-USER_BINS := hello sh ls cat echo mkdir rm rmdir touch wc cp
+USER_BINS := hello sh ls cat echo mkdir rm rmdir touch wc cp gfxtest desktop term gdemo
 MKFS      := tools/mkfs/target/x86_64-unknown-linux-gnu/release/mkfs
 DISK      := build/disk.img
 
 # The OS disk: a virtio block device, legacy interface only.
 QEMU_DISK = -drive file=$(1),if=none,id=disk0,format=raw -device virtio-blk-pci,drive=disk0,disable-modern=on
 
-.PHONY: all user kernel iso mkfs rootfs disk run test test-shell test-screen test-screen-selftest test-persistence test-crash test-fs clean
+.PHONY: all user kernel iso mkfs rootfs disk run test test-shell test-screen test-screen-selftest test-gfx test-user-libs test-desktop test-desktop-boot run-desktop test-persistence test-crash test-fs clean
 
 all: iso
 
@@ -51,6 +52,7 @@ endef
 iso: kernel $(LIMINE)/limine
 	$(call build_iso,$(ISO),limine.conf)
 	$(call build_iso,$(TEST_ISO),limine-test.conf)
+	$(call build_iso,$(DESKTOP_ISO),limine-desktop.conf)
 
 # The disk builder runs on the build machine and shares the kernel's filesystem code.
 mkfs:
@@ -75,6 +77,12 @@ run: iso disk
 	test -f build/disk-run.img || cp $(DISK) build/disk-run.img
 	qemu-system-x86_64 -cdrom $(ISO) -m 512M $(call QEMU_DISK,build/disk-run.img) -serial stdio -display none -no-reboot
 
+# The same, but straight into the graphical desktop, in a window (needs a machine
+# with a display; the build server has none).
+run-desktop: iso disk
+	test -f build/disk-run.img || cp $(DISK) build/disk-run.img
+	qemu-system-x86_64 -cdrom $(DESKTOP_ISO) -m 512M $(call QEMU_DISK,build/disk-run.img) -serial stdio -display gtk -no-reboot
+
 # Non-interactive: boot on a fresh copy of the disk, then check the serial log.
 test: iso disk
 	cp $(DISK) build/disk-test.img
@@ -88,6 +96,7 @@ test: iso disk
 		&& grep -q "\[ok\] disk self-test" serial.log \
 		&& grep -q "hello from user mode" serial.log \
 		&& grep -q "\[ok\] user-mode self-test" serial.log \
+		&& grep -q "\[ok\] gfx: screen released after exit and after a crash; a second run leaks nothing" serial.log \
 		&& grep -q "NovaOS shell" serial.log \
 		&& ! grep -q "KERNEL PANIC" serial.log && echo "TEST PASSED" || (echo "TEST FAILED"; exit 1)
 
@@ -105,6 +114,11 @@ test-screen: iso disk
 test-screen-selftest: iso disk
 	python3 scripts/screen_test.py $(TEST_ISO) $(DISK) build/screens-selftest
 
+# The mouse, keyboard routing and screen mapping against the real emulated devices
+# (QEMU monitor: mouse_move, mouse_button, sendkey, screendump).
+test-gfx: iso disk
+	python3 scripts/gfx_test.py $(ISO) $(DISK) build/gfx-screens
+
 test-persistence: iso disk
 	bash scripts/persistence_test.sh $(TEST_ISO) $(DISK) $(MKFS)
 
@@ -112,6 +126,20 @@ test-persistence: iso disk
 # the disk survives (informational; NovaFS has no journal yet).
 test-crash: iso disk
 	bash scripts/crash_test.sh $(TEST_ISO) $(DISK) $(MKFS) 30 1.2 "disk self-test"
+
+# The graphical desktop end to end: starts it, drives the emulated mouse and keyboard,
+# and compares whole screenshots with an independently built picture.
+test-desktop: iso disk
+	python3 scripts/desktop_test.py $(ISO) $(DISK) build/desktop-screens
+
+# The desktop boot image goes straight to the desktop, with no shell started first.
+test-desktop-boot: iso disk
+	python3 scripts/desktop_test.py --boot $(DESKTOP_ISO) $(DISK) build/desktop-screens
+
+# Unit tests of the user-space libraries (shared types, drawing, window manager),
+# run on the build machine.
+test-user-libs:
+	cd user && RUSTFLAGS="" cargo test --release --target x86_64-unknown-linux-gnu -p novaabi -p gfx -p wm
 
 # The filesystem's own unit tests, on the build machine.
 test-fs:

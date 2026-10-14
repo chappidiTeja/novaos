@@ -43,6 +43,13 @@ pub fn pipe() -> (PipeReader, PipeWriter) {
 }
 
 impl PipeReader {
+    /// Whether `read` would return without sleeping: data is waiting, or the
+    /// pipe is empty with no writer left (end of file).
+    pub fn ready(&self) -> bool {
+        let state = self.0.state.lock();
+        !state.buf.is_empty() || state.writers == 0
+    }
+
     /// Read up to `out.len()` bytes, sleeping until at least one is available.
     /// Returns 0 only at end of file (empty and every writer closed).
     pub fn read(&self, out: &mut [u8]) -> usize {
@@ -75,6 +82,13 @@ impl PipeReader {
 }
 
 impl PipeWriter {
+    /// Whether a write would make progress without sleeping: there is room, or
+    /// no reader is left (the write then fails at once).
+    pub fn ready(&self) -> bool {
+        let state = self.0.state.lock();
+        state.buf.len() < PIPE_CAPACITY || state.readers == 0
+    }
+
     /// Write all of `data`, sleeping while the pipe is full. If every reader is
     /// gone, returns what was written so far, or `BrokenPipe` if nothing was.
     pub fn write(&self, data: &[u8]) -> Result<usize, BrokenPipe> {

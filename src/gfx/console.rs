@@ -35,6 +35,9 @@ static mut CELL_STORE: [u8; MAX_CELLS] = [0; MAX_CELLS];
 
 struct Console {
     fb: Framebuffer,
+    /// False while a program owns the screen: text still updates the grid (so
+    /// nothing is lost) but nothing is drawn.
+    visible: bool,
     cols: usize,
     rows: usize,
     /// May equal `cols` right after writing the last column; the next
@@ -61,7 +64,7 @@ pub fn init() -> Option<(usize, usize, usize, usize)> {
     // Only this function ever creates the slice, and it runs once.
     let cells = unsafe { core::slice::from_raw_parts_mut(addr_of_mut!(CELL_STORE) as *mut u8, MAX_CELLS) };
     cells.fill(0);
-    let mut console = Console { fb, cols, rows, col: 0, row: 0, cells };
+    let mut console = Console { fb, visible: true, cols, rows, col: 0, row: 0, cells };
     console.fb.clear(BACKGROUND);
     let report = (console.fb.width, console.fb.height, cols, rows);
     console.draw_cursor(true);
@@ -84,6 +87,30 @@ pub fn redraw_all() {
     }
 }
 
+/// Whether there is a screen at all.
+pub fn is_active() -> bool {
+    CONSOLE.lock().is_some()
+}
+
+/// The screen's description, for handing it to a program that will draw on it.
+pub fn framebuffer_info() -> Option<super::fb::FramebufferInfo> {
+    let guard = CONSOLE.lock();
+    guard.as_ref()?.fb.describe(crate::mem::hhdm_offset())
+}
+
+/// Stop drawing (a program owns the screen). Text keeps updating the grid.
+pub fn suspend() {
+    if let Some(console) = CONSOLE.lock().as_mut() {
+        console.visible = false;
+    }
+}
+
+/// Take the screen back and repaint everything, including what was printed
+/// while it was away.
+pub fn resume() {
+    redraw_all();
+}
+
 /// For crash paths: the report must print even if the crash was inside the console.
 pub fn force_unlock() {
     unsafe { CONSOLE.force_unlock() };
@@ -96,6 +123,9 @@ impl Console {
 
     /// Draw character `ch` (0 = blank) in cell (col, row), replacing what was there.
     fn draw_cell(&mut self, col: usize, row: usize, ch: u8) {
+        if !self.visible {
+            return;
+        }
         let ch = if ch == 0 { b' ' } else { ch };
         let glyph = BASIC_LEGACY[(ch & 0x7F) as usize];
         let (x0, y0) = Self::cell_origin(col, row);
@@ -112,6 +142,7 @@ impl Console {
 
     /// Clear the screen and draw every character of the grid, then the cursor.
     fn redraw(&mut self) {
+        self.visible = true;
         self.fb.clear(BACKGROUND);
         for row in 0..self.rows {
             for col in 0..self.cols {
@@ -131,6 +162,9 @@ impl Console {
 
     /// Show or hide the cursor: a bar along the bottom of its cell.
     fn draw_cursor(&mut self, visible: bool) {
+        if !self.visible {
+            return;
+        }
         let (col, row) = self.cursor_cell();
         let (x0, y0) = Self::cell_origin(col, row);
         if visible {
@@ -151,6 +185,9 @@ impl Console {
         let (cols, rows) = (self.cols, self.rows);
         self.cells.copy_within(cols..rows * cols, 0);
         self.cells[(rows - 1) * cols..rows * cols].fill(0);
+        if !self.visible {
+            return;
+        }
         self.fb.scroll_up(CELL, BACKGROUND);
         // Moving the whole picture dragged some text pixels into the top margin.
         let width = self.fb.width;

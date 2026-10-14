@@ -8,10 +8,12 @@ mod elf;
 mod gdt;
 mod gfx;
 mod idt;
+mod input;
 mod ipc;
 mod keyboard;
 mod limine;
 mod mem;
+mod mouse;
 mod pci;
 mod pic;
 mod port;
@@ -23,6 +25,7 @@ mod syscall;
 mod timer;
 mod vfs;
 mod virtio_blk;
+mod winsys;
 
 use core::arch::asm;
 use core::panic::PanicInfo;
@@ -75,6 +78,15 @@ extern "C" fn _start() -> ! {
     timer::init(TIMER_HZ);
     println!("[ok] PIC remapped, PIT at {} Hz", TIMER_HZ);
 
+    if let Some((w, h, _, _)) = screen {
+        input::set_bounds(w, h);
+    }
+    if mouse::init() {
+        println!("[ok] PS/2 mouse enabled");
+    } else {
+        println!("[mouse] not available");
+    }
+
     mem::init();
     if selftest {
         mem::self_test();
@@ -118,10 +130,9 @@ extern "C" fn _start() -> ! {
 
     // Hand the machine to the shell on the disk; without a disk, fall back to a
     // tiny demo that reads one line.
-    if proc::spawn_init() {
-        println!("[ok] started /bin/sh");
-    } else {
-        proc::spawn_console_demo();
+    match proc::spawn_init() {
+        Some(program) => println!("[ok] started {}", program),
+        None => proc::spawn_console_demo(),
     }
 
     // Nothing left for the boot thread to do; let the idle thread have the CPU.

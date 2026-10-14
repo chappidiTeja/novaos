@@ -35,6 +35,11 @@ pub fn push_input(byte: u8) {
     READABLE.wake_one();
 }
 
+/// Whether `read` would return without sleeping.
+pub fn input_ready() -> bool {
+    INPUT.lock().len > 0
+}
+
 /// Read up to `out.len()` bytes, sleeping until at least one is available.
 pub fn read(out: &mut [u8]) -> usize {
     if out.is_empty() {

@@ -19,6 +19,21 @@ impl Color {
     }
 }
 
+/// What a program needs to know to draw on the screen directly.
+#[derive(Clone, Copy, Debug)]
+pub struct FramebufferInfo {
+    pub phys: u64,
+    pub width: u64,
+    pub height: u64,
+    /// Bytes per row.
+    pub pitch: u64,
+    pub red_shift: u64,
+    pub green_shift: u64,
+    pub blue_shift: u64,
+    /// Total size: pitch * height.
+    pub bytes: u64,
+}
+
 /// Largest dimensions accepted (guards the arithmetic below against garbage).
 const MAX_DIMENSION: u64 = 16384;
 
@@ -71,6 +86,24 @@ impl Framebuffer {
             red_shift: d.red_mask_shift as u32,
             green_shift: d.green_mask_shift as u32,
             blue_shift: d.blue_mask_shift as u32,
+        })
+    }
+
+    /// Everything a program needs to draw on this screen itself.
+    pub fn describe(&self, hhdm_offset: u64) -> Option<FramebufferInfo> {
+        let virt = self.base as u64;
+        // The bootloader gives a direct-map address; turn it back into the
+        // physical address the pixels really live at.
+        let phys = virt.checked_sub(hhdm_offset)?;
+        Some(FramebufferInfo {
+            phys,
+            width: self.width as u64,
+            height: self.height as u64,
+            pitch: self.pitch as u64,
+            red_shift: self.red_shift as u64,
+            green_shift: self.green_shift as u64,
+            blue_shift: self.blue_shift as u64,
+            bytes: (self.pitch * self.height) as u64,
         })
     }
 

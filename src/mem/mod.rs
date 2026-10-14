@@ -12,6 +12,11 @@ pub const PAGE_SIZE: u64 = 4096;
 
 static HHDM_OFFSET: AtomicU64 = AtomicU64::new(0);
 
+/// Where the direct map of physical memory starts (phys + this = virtual address).
+pub fn hhdm_offset() -> u64 {
+    HHDM_OFFSET.load(Ordering::Relaxed)
+}
+
 /// Pointer through which the kernel can access physical address `phys`.
 /// Limine maps all of RAM at a fixed offset (the higher-half direct map).
 pub fn phys_to_virt(phys: u64) -> *mut u8 {

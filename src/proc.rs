@@ -11,6 +11,7 @@ use crate::ipc::waitq::WaitQueue;
 use crate::mem::{pmm, vmm, PAGE_SIZE};
 use crate::sync::SpinLock;
 use crate::vfs::Cwd;
+use crate::winsys::UserMem;
 use crate::{elf, println, sched, timer};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -76,6 +77,11 @@ pub struct UserProc {
     /// Shared so system calls can use it without holding the scheduler's data.
     pub fds: Arc<SpinLock<FdTable>>,
     pub cwd: Arc<SpinLock<Cwd>>,
+    /// Heap pages and shared mappings. Declared after `space` on purpose:
+    /// fields are dropped in order, so the address space (and with it every page
+    /// table entry pointing at shared frames) is gone before the `Arc`s that keep
+    /// those frames alive are released.
+    pub mem: Arc<UserMem>,
 }
 
 #[derive(Debug)]
@@ -184,6 +190,7 @@ pub fn spawn_user_in(
             handle: handle.clone(),
             fds: Arc::new(SpinLock::new(fds)),
             cwd: Arc::new(SpinLock::new(cwd)),
+            mem: Arc::new(UserMem::new()),
         },
     );
     Ok(handle)
@@ -206,17 +213,34 @@ pub fn wait_forever(handle: &ProcHandle) -> i64 {
     handle.exit_code().unwrap_or(0)
 }
 
-/// Start the first user program: the shell from the disk. False if there is no
-/// disk or no shell on it.
-pub fn spawn_init() -> bool {
-    let image = match crate::vfs::read_file("/bin/sh", novafs::ROOT_INO, 4 << 20) {
+/// Start the first user program: the desktop if the boot menu entry asks for it,
+/// otherwise the shell, both from the disk. Returns the program's path, or None if
+/// there is no disk or nothing to start on it.
+pub fn spawn_init() -> Option<&'static str> {
+    // The boot menu entry can ask for the graphical desktop instead of the shell.
+    if crate::limine::cmdline_has("desktop") {
+        if spawn_from_disk("/bin/desktop", "desktop", b"desktop\0") {
+            return Some("/bin/desktop");
+        }
+        println!("[init] no desktop on the disk; starting the shell instead");
+    }
+    if spawn_from_disk("/bin/sh", "sh", b"sh\0") {
+        Some("/bin/sh")
+    } else {
+        None
+    }
+}
+
+/// Start the program at `path` on the disk with the console as its stdin/stdout.
+fn spawn_from_disk(path: &str, name: &str, argv: &[u8]) -> bool {
+    let image = match crate::vfs::read_file(path, novafs::ROOT_INO, 4 << 20) {
         Ok(image) => image,
         Err(_) => return false,
     };
-    match spawn_user_in("sh", &image, 0, FdTable::with_stdio(), Cwd::root(), b"sh\0", 1) {
+    match spawn_user_in(name, &image, 0, FdTable::with_stdio(), Cwd::root(), argv, 1) {
         Ok(_) => true,
         Err(e) => {
-            println!("[init] could not start /bin/sh: {:?}", e);
+            println!("[init] could not start {}: {:?}", path, e);
             false
         }
     }
@@ -245,12 +269,21 @@ pub fn current_cwd() -> Option<Arc<SpinLock<Cwd>>> {
     sched::with_current_user(|u| u.cwd.clone())
 }
 
-/// Close every descriptor (so pipe peers see EOF) and publish the exit status.
+/// The calling process's dynamic memory (heap pages, shared mappings).
+pub fn current_mem() -> Option<Arc<UserMem>> {
+    sched::with_current_user(|u| u.mem.clone())
+}
+
+/// Close every descriptor (so pipe peers see EOF), let go of the screen and any
+/// windows, and publish the exit status.
 fn finish_current(code: i64) {
     if let Some(fds) = current_fds() {
         fds.lock().close_all();
     }
     if let Some(handle) = sched::current_user_handle() {
+        // Before publishing the exit: anyone waiting for this process must find
+        // the screen already released.
+        crate::winsys::on_process_exit(handle.pid);
         handle.finish(code);
     }
 }
@@ -355,6 +388,50 @@ pub fn self_test() {
         println!("[ok] user: file system calls work, and leave the disk as they found it");
     } else {
         println!("[skip] user: no disk, file system call tests not run");
+    }
+
+    // The screen, input and window system calls, tested with the gfxtest program
+    // from the disk. They need a screen, so they are skipped on a machine without one.
+    // The whole cycle runs twice: the first run warms up things that are allocated once
+    // and kept (disk blocks in the cache, the first node of a lookup table). After
+    // that, a second run must leave the heap, the free frames and the thread count
+    // exactly as it found them, so any per-run leak shows up.
+    if crate::gfx::console::is_active() && crate::vfs::is_mounted() {
+        let run_gfx = |mode: &'static str, expect: i64| {
+            // The file image and handle live only inside this block, so that they are
+            // gone before anything is measured.
+            let code = {
+                let image = crate::vfs::read_file("/bin/gfxtest", novafs::ROOT_INO, 4 << 20)
+                    .expect("/bin/gfxtest is missing from the disk");
+                let mut argv = alloc::vec::Vec::new();
+                for part in ["gfxtest", mode] {
+                    argv.extend_from_slice(part.as_bytes());
+                    argv.push(0);
+                }
+                let handle = spawn_user_in("gfxtest", &image, 0, FdTable::with_stdio(), Cwd::root(), &argv, 2)
+                    .expect("could not start gfxtest");
+                wait(&handle, 3000).unwrap_or_else(|| panic!("gfxtest {} timed out", mode))
+            };
+            assert_eq!(code, expect, "gfxtest {} ended with the wrong status", mode);
+            println!("[ok] gfx: {} -> {}", mode, code);
+        };
+        let cycle = || {
+            run_gfx("misuse", 0);
+            run_gfx("alloc", 0);
+            // A desktop that crashes must give the screen and keyboard back: the very
+            // next claim (inside "lifecycle") only works if it did.
+            run_gfx("crash", PF);
+            run_gfx("lifecycle", 0);
+            sched::sleep_ticks(20); // let every process thread be reaped before measuring
+        };
+        cycle();
+        let (frames_a, heap_a, threads_a) = (pmm::stats().0, crate::mem::heap::used(), sched::thread_count());
+        cycle();
+        let (frames_b, heap_b, threads_b) = (pmm::stats().0, crate::mem::heap::used(), sched::thread_count());
+        assert_eq!(frames_b, frames_a, "the graphics tests leaked physical frames");
+        assert_eq!(heap_b, heap_a, "the graphics tests leaked kernel heap");
+        assert_eq!(threads_b, threads_a, "the graphics tests leaked threads");
+        println!("[ok] gfx: screen released after exit and after a crash; a second run leaks nothing");
     }
 
     sched::sleep_ticks(10); // let earlier threads be reaped before measuring

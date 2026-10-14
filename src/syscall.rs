@@ -7,7 +7,7 @@
 //!
 //! Numbers: 0 exit(code), 1 write(fd, ptr, len), 2 getpid(), 3 sleep(ticks),
 //!          4 yield(), 5 ticks(), 6 read(fd, ptr, len), 7 pipe(fds_ptr),
-//!          8 close(fd),
+//!          8 close(fd), 31 fd_ready(fd),
 //!          9 open(path, flags), 10 lseek(fd, offset, whence), 11 fstat(fd, out),
 //!          12 stat(path, out), 13 readdir(fd, out), 14 mkdir(path),
 //!          15 unlink(path), 16 rmdir(path), 17 chdir(path), 18 getcwd(buf, len),
@@ -37,6 +37,10 @@ use crate::ipc::pipe::{self, BrokenPipe};
 use crate::mem::vmm;
 use crate::vfs;
 use crate::{proc, sched, serial, timer};
+// Screen, input and window calls live in their own file but share this module's helpers.
+#[path = "syscall_gfx.rs"]
+mod gfx;
+
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::arch::{asm, global_asm};
@@ -63,6 +67,17 @@ const SYS_CHDIR: u64 = 17;
 const SYS_GETCWD: u64 = 18;
 const SYS_SPAWN: u64 = 19;
 const SYS_WAITPID: u64 = 20;
+const SYS_GFX_CLAIM: u64 = 21;
+const SYS_MEM_ALLOC: u64 = 22;
+const SYS_INPUT_NEXT: u64 = 23;
+const SYS_WIN_CREATE: u64 = 24;
+const SYS_WIN_DESTROY: u64 = 25;
+const SYS_WIN_LIST: u64 = 26;
+const SYS_WIN_MAP: u64 = 27;
+const SYS_WIN_POST: u64 = 28;
+const SYS_WIN_EVENT: u64 = 29;
+const SYS_WIN_FLUSH: u64 = 30;
+const SYS_FD_READY: u64 = 31;
 
 const E2BIG: i64 = -7;
 const ENOEXEC: i64 = -8;
@@ -170,6 +185,17 @@ extern "C" fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> 
     match nr {
         SYS_SPAWN => sys_spawn(a1, a2, a3, a4, a5),
         SYS_WAITPID => sys_waitpid(a1),
+        SYS_GFX_CLAIM => gfx::sys_gfx_claim(a1),
+        SYS_MEM_ALLOC => gfx::sys_mem_alloc(a1),
+        SYS_INPUT_NEXT => gfx::sys_input_next(a1, a2),
+        SYS_WIN_CREATE => gfx::sys_win_create(a1, a2, a3, a4, a5),
+        SYS_WIN_DESTROY => gfx::sys_win_destroy(a1),
+        SYS_WIN_LIST => gfx::sys_win_list(a1, a2),
+        SYS_WIN_MAP => gfx::sys_win_map(a1),
+        SYS_WIN_POST => gfx::sys_win_post(a1, a2),
+        SYS_WIN_EVENT => gfx::sys_win_event(a1, a2, a3),
+        SYS_WIN_FLUSH => gfx::sys_win_flush(a1),
+        SYS_FD_READY => sys_fd_ready(a1),
         SYS_EXIT => proc::exit_current(a1 as i64),
         SYS_WRITE => sys_write(a1, a2, a3),
         SYS_READ => sys_read(a1, a2, a3),
@@ -573,6 +599,23 @@ fn sys_pipe(fds_ptr: u64) -> i64 {
         Ok(()) => 0,
         Err(e) => e,
     }
+}
+
+/// 31: fd_ready(fd). 1 if reading (or, for a write end, writing) would not make
+/// the caller sleep, 0 if it would. A program that must watch two things at once
+/// (the terminal window: its own events and the shell's output) polls with this.
+fn sys_fd_ready(fd: u64) -> i64 {
+    let file = match lookup_fd(fd) {
+        Some(file) => file,
+        None => return EBADF,
+    };
+    let ready = match &*file {
+        File::Console => console::input_ready(),
+        File::PipeRead(pipe) => pipe.ready(),
+        File::PipeWrite(pipe) => pipe.ready(),
+        File::Disk(_) => true,
+    };
+    ready as i64
 }
 
 fn sys_close(fd: u64) -> i64 {

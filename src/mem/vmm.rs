@@ -15,6 +15,11 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub const PRESENT: u64 = 1 << 0;
 pub const WRITABLE: u64 = 1 << 1;
 pub const USER: u64 = 1 << 2;
+/// Software bit (ignored by the CPU): the frame behind this page is not owned by
+/// the address space, so tearing the address space down must not free it. Used
+/// for the framebuffer and for shared-memory windows, whose frames are owned by
+/// something else.
+pub const NOFREE: u64 = 1 << 9;
 const HUGE: u64 = 1 << 7;
 const NO_EXECUTE: u64 = 1 << 63;
 const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
@@ -269,7 +274,7 @@ pub fn destroy_address_space(pml4: u64) {
                 let pt = e2 & ADDR_MASK;
                 for i1 in 0..512 {
                     let e1 = unsafe { read_volatile(entry(pt, i1)) };
-                    if e1 & PRESENT != 0 {
+                    if e1 & PRESENT != 0 && e1 & NOFREE == 0 {
                         pmm::free_frame(e1 & ADDR_MASK);
                     }
                 }

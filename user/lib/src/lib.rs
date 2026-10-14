@@ -16,6 +16,10 @@
 
 #![no_std]
 
+// The types that cross the system call boundary live in their own tiny crate, so
+// the window manager can share them without pulling in this library's runtime.
+pub use novaabi::*;
+
 use core::arch::asm;
 use core::fmt;
 use core::panic::PanicInfo;
@@ -242,8 +246,114 @@ pub fn waitpid(pid: u64) -> i64 {
     unsafe { syscall(SYS_WAITPID, pid, 0, 0, 0, 0) }
 }
 
+// ---- screen, input and windows ----------------------------------------------------------
+
+pub const SYS_GFX_CLAIM: u64 = 21;
+pub const SYS_MEM_ALLOC: u64 = 22;
+pub const SYS_INPUT_NEXT: u64 = 23;
+pub const SYS_WIN_CREATE: u64 = 24;
+pub const SYS_WIN_DESTROY: u64 = 25;
+pub const SYS_WIN_LIST: u64 = 26;
+pub const SYS_WIN_MAP: u64 = 27;
+pub const SYS_WIN_POST: u64 = 28;
+pub const SYS_WIN_EVENT: u64 = 29;
+pub const SYS_WIN_FLUSH: u64 = 30;
+pub const SYS_FD_READY: u64 = 31;
+
+/// Error numbers (the system calls return them negated).
+pub mod errno {
+    pub const EPERM: i64 = -1;
+    pub const ENOENT: i64 = -2;
+    pub const EBADF: i64 = -9;
+    pub const ENOMEM: i64 = -12;
+    pub const EFAULT: i64 = -14;
+    pub const EBUSY: i64 = -16;
+    pub const ENODEV: i64 = -19;
+    pub const EINVAL: i64 = -22;
+}
+
+/// Wait as long as it takes.
+pub const FOREVER: u64 = u64::MAX;
+
+/// Take over the screen and the keyboard and mouse. On success the framebuffer
+/// is mapped and `info` describes it. Fails with EBUSY if someone else has it.
+pub fn gfx_claim(info: &mut ScreenInfo) -> i64 {
+    unsafe { syscall(SYS_GFX_CLAIM, info as *mut ScreenInfo as u64, 0, 0, 0, 0) }
+}
+
+/// `pages` fresh zeroed pages of memory (4096 bytes each); returns the address,
+/// or a negative error.
+pub fn mem_alloc(pages: u64) -> i64 {
+    unsafe { syscall(SYS_MEM_ALLOC, pages, 0, 0, 0, 0) }
+}
+
+/// The desktop's next input event: 1 = filled `event`, 0 = timed out.
+pub fn input_next(event: &mut Event, timeout_ticks: u64) -> i64 {
+    unsafe { syscall(SYS_INPUT_NEXT, event as *mut Event as u64, timeout_ticks, 0, 0, 0) }
+}
+
+/// Create a window. On success returns (id, address of its pixels); the pixels
+/// are `width * height` 32-bit values, 0x00RRGGBB (red in bits 16-23), whatever
+/// the screen's own channel order is; the desktop converts when it paints.
+pub fn win_create(width: u32, height: u32, title: &[u8]) -> Result<(u32, u64), i64> {
+    let mut out = [0u64; 2];
+    let r = unsafe {
+        syscall(
+            SYS_WIN_CREATE,
+            width as u64,
+            height as u64,
+            title.as_ptr() as u64,
+            title.len() as u64,
+            out.as_mut_ptr() as u64,
+        )
+    };
+    if r < 0 {
+        Err(r)
+    } else {
+        Ok((out[0] as u32, out[1]))
+    }
+}
+
+pub fn win_destroy(id: u32) -> i64 {
+    unsafe { syscall(SYS_WIN_DESTROY, id as u64, 0, 0, 0, 0) }
+}
+
+/// The desktop only: fill `list` with the windows that exist; returns how many.
+pub fn win_list(list: &mut [WinInfo]) -> i64 {
+    unsafe { syscall(SYS_WIN_LIST, list.as_mut_ptr() as u64, list.len() as u64, 0, 0, 0) }
+}
+
+/// The desktop only: map window `id`'s pixels read-only; returns the address.
+pub fn win_map(id: u32) -> i64 {
+    unsafe { syscall(SYS_WIN_MAP, id as u64, 0, 0, 0, 0) }
+}
+
+/// The desktop only: send `event` (one of the EV_WIN_* kinds) to the window's owner.
+pub fn win_post(id: u32, event: &Event) -> i64 {
+    unsafe { syscall(SYS_WIN_POST, id as u64, event as *const Event as u64, 0, 0, 0) }
+}
+
+/// A window's owner: the next event for it. 1 = filled `event`, 0 = timed out.
+pub fn win_event(id: u32, event: &mut Event, timeout_ticks: u64) -> i64 {
+    unsafe { syscall(SYS_WIN_EVENT, id as u64, event as *mut Event as u64, timeout_ticks, 0, 0) }
+}
+
+/// 1 if reading `fd` (or writing, for a write end) would not make the caller
+/// sleep, 0 if it would; negative on error. For watching two things at once.
+pub fn fd_ready(fd: u64) -> i64 {
+    unsafe { syscall(SYS_FD_READY, fd, 0, 0, 0, 0) }
+}
+
+/// A window's owner: tell the desktop the pixels changed.
+pub fn win_flush(id: u32) -> i64 {
+    unsafe { syscall(SYS_WIN_FLUSH, id as u64, 0, 0, 0, 0) }
+}
+
 pub fn strerror(code: i64) -> &'static str {
     match code {
+        -1 => "Operation not permitted",
+        -16 => "Device or resource busy",
+        -19 => "No such device",
         -2 => "No such file or directory",
         -5 => "I/O error",
         -9 => "Bad file descriptor",

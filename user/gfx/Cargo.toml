@@ -1,0 +1,8 @@
+[package]
+name = "gfx"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# 8x8 bitmap font (MIT licence).
+font8x8 = { version = "0.3.1", default-features = false }

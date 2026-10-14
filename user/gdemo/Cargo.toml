@@ -1,0 +1,8 @@
+[package]
+name = "gdemo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nova = { path = "../lib" }
+gfx = { path = "../gfx" }

@@ -8,6 +8,7 @@ use crate::{keyboard, pic, println, sched, timer};
 pub const IRQ_TIMER: u8 = pic::IRQ_BASE;
 pub const IRQ_KEYBOARD: u8 = pic::IRQ_BASE + 1;
 pub const IRQ_SERIAL: u8 = pic::IRQ_BASE + 4;
+pub const IRQ_MOUSE: u8 = pic::IRQ_BASE + 12;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -77,6 +78,7 @@ pub fn init() {
     set(IRQ_TIMER, timer_irq as *const () as usize, 0);
     set(IRQ_KEYBOARD, keyboard_irq as *const () as usize, 0);
     set(IRQ_SERIAL, serial_irq as *const () as usize, 0);
+    set(IRQ_MOUSE, mouse_irq as *const () as usize, 0);
 
     let ptr = DescriptorPointer {
         limit: (size_of::<[Entry; 256]>() - 1) as u16,
@@ -153,6 +155,11 @@ extern "x86-interrupt" fn timer_irq(_frame: InterruptStackFrame) {
 extern "x86-interrupt" fn keyboard_irq(_frame: InterruptStackFrame) {
     keyboard::handle_interrupt();
     pic::end_of_interrupt(IRQ_KEYBOARD);
+}
+
+extern "x86-interrupt" fn mouse_irq(_frame: InterruptStackFrame) {
+    crate::mouse::handle_interrupt();
+    pic::end_of_interrupt(IRQ_MOUSE); // IRQ 12 is on the second PIC: both get the EOI
 }
 
 extern "x86-interrupt" fn serial_irq(_frame: InterruptStackFrame) {

@@ -3,7 +3,10 @@
 [workspace]
 resolver = "2"
 members = [
+    "abi",
     "lib",
+    "gfx",
+    "wm",
     "hello",
     "sh",
     "ls",
@@ -15,6 +18,10 @@ members = [
     "touch",
     "wc",
     "cp",
+    "gfxtest",
+    "desktop",
+    "term",
+    "gdemo",
 ]
 
 [profile.release]
