@@ -1,4 +1,5 @@
 use crate::port::{inb, outb};
+use crate::sync::SpinLock;
 use core::fmt::{self, Write};
 
 const COM1: u16 = 0x3F8;
@@ -37,10 +38,20 @@ impl Write for Serial {
     }
 }
 
-// No lock yet: output from an interrupt handler can interleave with normal output.
+// Interrupts are off while this is held, so a line from one thread (or an
+// interrupt handler) is never split by another.
+static PRINT_LOCK: SpinLock<()> = SpinLock::new(());
+
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
+    let _guard = PRINT_LOCK.lock();
     let _ = Serial.write_fmt(args);
+}
+
+/// For crash paths: make sure the report can be printed even if the code that
+/// crashed was in the middle of printing.
+pub fn force_unlock() {
+    unsafe { PRINT_LOCK.force_unlock() };
 }
 
 #[macro_export]

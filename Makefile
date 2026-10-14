@@ -31,11 +31,12 @@ run: iso
 
 # Non-interactive: boot for a few seconds, then check the serial log.
 test: iso
-	-timeout 5 qemu-system-x86_64 -cdrom $(ISO) -m 512M -serial file:serial.log -display none -no-reboot
+	-timeout 10 qemu-system-x86_64 -cdrom $(ISO) -m 512M -serial file:serial.log -display none -no-reboot
 	@cat serial.log
 	@grep -q "BREAKPOINT" serial.log && grep -q "\[ok\] timer" serial.log \
 		&& grep -q "\[ok\] pmm self-test" serial.log && grep -q "\[ok\] vmm self-test" serial.log \
 		&& grep -q "\[ok\] heap self-test" serial.log \
+		&& grep -q "\[ok\] scheduler self-test" serial.log \
 		&& ! grep -q "KERNEL PANIC" serial.log && echo "TEST PASSED" || (echo "TEST FAILED"; exit 1)
 
 clean:

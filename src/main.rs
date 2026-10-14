@@ -11,6 +11,7 @@ mod limine;
 mod mem;
 mod pic;
 mod port;
+mod sched;
 mod serial;
 mod sync;
 mod timer;
@@ -62,6 +63,10 @@ extern "C" fn _start() -> ! {
     }
     println!("[ok] timer: {} ticks (~1 second)", timer::ticks());
 
+    sched::init();
+    println!("[ok] scheduler: main + idle threads");
+    sched::self_test();
+
     println!("Type on the keyboard:");
     loop {
         wait_for_interrupt();
@@ -70,6 +75,7 @@ extern "C" fn _start() -> ! {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    serial::force_unlock();
     println!("KERNEL PANIC: {}", info);
     halt_forever()
 }

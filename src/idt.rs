@@ -3,7 +3,7 @@ use core::mem::size_of;
 use core::ptr::{addr_of, addr_of_mut};
 
 use crate::gdt::{DOUBLE_FAULT_IST, KERNEL_CS};
-use crate::{keyboard, pic, println, timer};
+use crate::{keyboard, pic, println, sched, timer};
 
 pub const IRQ_TIMER: u8 = pic::IRQ_BASE;
 pub const IRQ_KEYBOARD: u8 = pic::IRQ_BASE + 1;
@@ -86,6 +86,7 @@ pub fn init() {
 }
 
 fn fatal(name: &str, frame: &InterruptStackFrame, error_code: Option<u64>) -> ! {
+    crate::serial::force_unlock();
     println!("\n*** EXCEPTION: {} ***", name);
     if let Some(code) = error_code {
         println!("error code: {:#x}", code);
@@ -126,7 +127,10 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: u64) {
 
 extern "x86-interrupt" fn timer_irq(_frame: InterruptStackFrame) {
     timer::tick();
+    // Acknowledge first: the scheduler below may switch to another thread and
+    // not come back for a while, and the PIC sends no more timer IRQs until EOI.
     pic::end_of_interrupt(IRQ_TIMER);
+    sched::on_tick();
 }
 
 extern "x86-interrupt" fn keyboard_irq(_frame: InterruptStackFrame) {
