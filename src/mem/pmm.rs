@@ -62,6 +62,32 @@ impl Pmm {
         None
     }
 
+    /// `count` consecutive free frames, above the first MiB (legacy low memory).
+    fn alloc_contiguous(&mut self, count: usize) -> Option<u64> {
+        if count == 0 || self.free < count {
+            return None;
+        }
+        let (mut run, mut start) = (0usize, 0usize);
+        for frame in 0x100..self.frames {
+            if self.is_used(frame) {
+                run = 0;
+                continue;
+            }
+            if run == 0 {
+                start = frame;
+            }
+            run += 1;
+            if run == count {
+                for f in start..start + count {
+                    self.set_used(f);
+                }
+                self.free -= count;
+                return Some(start as u64 * PAGE_SIZE);
+            }
+        }
+        None
+    }
+
     fn free_frame(&mut self, phys: u64) {
         assert!(phys % PAGE_SIZE == 0, "pmm: unaligned free {:#x}", phys);
         let frame = (phys / PAGE_SIZE) as usize;
@@ -148,6 +174,14 @@ pub fn alloc_zeroed_frame() -> Option<u64> {
 
 pub fn free_frame(phys: u64) {
     PMM.lock().free_frame(phys);
+}
+
+/// `count` physically consecutive, zero-filled frames (for DMA structures that
+/// must not be scattered). Returns the physical address of the first.
+pub fn alloc_contiguous_zeroed(count: usize) -> Option<u64> {
+    let phys = PMM.lock().alloc_contiguous(count)?;
+    unsafe { core::ptr::write_bytes(phys_to_virt(phys), 0, count * PAGE_SIZE as usize) };
+    Some(phys)
 }
 
 /// (free frames, total usable frames)

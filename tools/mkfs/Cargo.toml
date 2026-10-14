@@ -1,0 +1,10 @@
+[package]
+name = "mkfs"
+version = "0.1.0"
+edition = "2021"
+
+# Host tool, built for the build machine's own target; not part of the kernel build.
+[workspace]
+
+[dependencies]
+novafs = { path = "../../fs" }

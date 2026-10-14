@@ -11,6 +11,7 @@ mod ipc;
 mod keyboard;
 mod limine;
 mod mem;
+mod pci;
 mod pic;
 mod port;
 mod proc;
@@ -19,6 +20,8 @@ mod serial;
 mod sync;
 mod syscall;
 mod timer;
+mod vfs;
+mod virtio_blk;
 
 use core::arch::asm;
 use core::panic::PanicInfo;
@@ -73,12 +76,22 @@ extern "C" fn _start() -> ! {
     sched::self_test();
     ipc::selftest::self_test();
 
+    match vfs::init() {
+        Ok(()) => vfs::self_test(),
+        Err(reason) => println!("[disk] not available: {}", reason),
+    }
+
     syscall::init();
     println!("[ok] syscall interface enabled");
     proc::self_test();
 
-    // Interactive demo: reads a line from the keyboard or serial port.
-    proc::spawn_console_demo();
+    // Hand the machine to the shell on the disk; without a disk, fall back to a
+    // tiny demo that reads one line.
+    if proc::spawn_init() {
+        println!("[ok] started /bin/sh");
+    } else {
+        proc::spawn_console_demo();
+    }
 
     // Nothing left for the boot thread to do; let the idle thread have the CPU.
     loop {

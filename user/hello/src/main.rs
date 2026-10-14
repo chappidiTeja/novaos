@@ -18,7 +18,35 @@ const SYS_TICKS: u64 = 5;
 const SYS_READ: u64 = 6;
 const SYS_PIPE: u64 = 7;
 const SYS_CLOSE: u64 = 8;
+const SYS_OPEN: u64 = 9;
+const SYS_LSEEK: u64 = 10;
+const SYS_FSTAT: u64 = 11;
+const SYS_STAT: u64 = 12;
+const SYS_READDIR: u64 = 13;
+const SYS_MKDIR: u64 = 14;
+const SYS_UNLINK: u64 = 15;
+const SYS_RMDIR: u64 = 16;
+const SYS_CHDIR: u64 = 17;
+const SYS_GETCWD: u64 = 18;
 
+const O_RDONLY: u64 = 0;
+const O_WRONLY: u64 = 1;
+const O_RDWR: u64 = 2;
+const O_CREAT: u64 = 0x40;
+const O_EXCL: u64 = 0x80;
+const O_TRUNC: u64 = 0x200;
+const O_APPEND: u64 = 0x400;
+const SEEK_SET: u64 = 0;
+const SEEK_CUR: u64 = 1;
+const SEEK_END: u64 = 2;
+
+const ENOENT: i64 = -2;
+const EEXIST: i64 = -17;
+const ENOTDIR: i64 = -20;
+const EISDIR: i64 = -21;
+const ERANGE: i64 = -34;
+const ENAMETOOLONG: i64 = -36;
+const ENOTEMPTY: i64 = -39;
 const EBADF: i64 = -9;
 const EFAULT: i64 = -14;
 const EINVAL: i64 = -22;
@@ -119,8 +147,254 @@ pub extern "C" fn _start(mode: u64) -> ! {
         13 => pipe_reader(),
         14 => pipe_syscalls(),
         15 => broken_pipe(),
+        16 => fs_syscalls(),
         _ => exit(99),
     }
+}
+
+// ---- file system calls (paths are NUL-terminated byte strings) -------------------
+
+fn open(path: &[u8], flags: u64) -> i64 {
+    unsafe { syscall(SYS_OPEN, path.as_ptr() as u64, flags, 0) }
+}
+
+fn lseek(fd: i64, offset: i64, whence: u64) -> i64 {
+    unsafe { syscall(SYS_LSEEK, fd as u64, offset as u64, whence) }
+}
+
+fn fstat(fd: i64, out: &mut [u64; 5]) -> i64 {
+    unsafe { syscall(SYS_FSTAT, fd as u64, out.as_mut_ptr() as u64, 0) }
+}
+
+fn stat(path: &[u8], out: &mut [u64; 5]) -> i64 {
+    unsafe { syscall(SYS_STAT, path.as_ptr() as u64, out.as_mut_ptr() as u64, 0) }
+}
+
+fn path_call(nr: u64, path: &[u8]) -> i64 {
+    unsafe { syscall(nr, path.as_ptr() as u64, 0, 0) }
+}
+
+/// Counts failed checks and says which ones failed.
+struct Checks {
+    failed: u32,
+}
+
+impl Checks {
+    fn ok(&mut self, what: &str, condition: bool) {
+        if !condition {
+            print("FAIL ");
+            print(what);
+            print("\n");
+            self.failed += 1;
+        }
+    }
+
+    fn expect(&mut self, what: &str, got: i64, want: i64) {
+        if got != want {
+            print("FAIL ");
+            print(what);
+            print(": got ");
+            print_signed(got);
+            print(", wanted ");
+            print_signed(want);
+            print("\n");
+            self.failed += 1;
+        }
+    }
+}
+
+fn rd(fd: i64, buf: &mut [u8]) -> i64 {
+    read(fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64)
+}
+
+fn wr(fd: i64, data: &[u8]) -> i64 {
+    write(fd as u64, data.as_ptr() as u64, data.len() as u64)
+}
+
+fn fs_syscalls() -> ! {
+    let mut c = Checks { failed: 0 };
+    let mut buf = [0u8; 256];
+    let mut st = [0u64; 5];
+
+    // A file the disk builder put on the disk: read, stat, seek.
+    let fd = open(b"/hello.txt\0", O_RDONLY);
+    c.ok("open /hello.txt", fd >= 3);
+    c.expect("read it", rd(fd, &mut buf), 19);
+    c.ok("contents", &buf[..19] == b"Hello from NovaFS!\n");
+    c.expect("read at end of file", rd(fd, &mut buf), 0);
+    c.expect("fstat", fstat(fd, &mut st), 0);
+    c.ok("fstat says: regular file of 19 bytes", st[1] == 1 && st[2] == 19);
+    c.expect("seek from start", lseek(fd, 6, SEEK_SET), 6);
+    c.expect("read after seek", rd(fd, &mut buf[..4]), 4);
+    c.ok("seeked contents", &buf[..4] == b"from");
+    c.expect("seek from current", lseek(fd, 1, SEEK_CUR), 11);
+    c.expect("seek from end", lseek(fd, -3, SEEK_END), 16);
+    c.expect("seek before the start", lseek(fd, -100, SEEK_SET), EINVAL);
+    c.expect("write to a read-only file", wr(fd, b"x"), EBADF);
+    c.expect("close", close(fd as u64), 0);
+    c.expect("read from a closed descriptor", rd(fd, &mut buf), EBADF);
+
+    // Ways opening can fail.
+    c.expect("open a missing file", open(b"/nope\0", O_RDONLY), ENOENT);
+    c.expect("open a directory for writing", open(b"/docs\0", O_WRONLY), EISDIR);
+    c.expect("open below a file", open(b"/hello.txt/x\0", O_RDONLY), ENOTDIR);
+    c.expect(
+        "path pointing into the kernel",
+        unsafe { syscall(SYS_OPEN, 0xffff_8000_0000_0000, 0, 0) },
+        EFAULT,
+    );
+    // Path length limit: 255 characters. Built from short components ("/a/a/a...")
+    // so only the overall length, not any single name, can be what is rejected.
+    let mut at_limit = [0u8; 256];
+    for i in 0..127 {
+        at_limit[2 * i] = b'/';
+        at_limit[2 * i + 1] = b'a';
+    }
+    at_limit[254] = b'/'; // 255 characters, then the NUL
+    c.expect("255-character path is accepted (and not found)", open(&at_limit, O_RDONLY), ENOENT);
+    let mut over_limit = [0u8; 257];
+    for i in 0..128 {
+        over_limit[2 * i] = b'/';
+        over_limit[2 * i + 1] = b'a';
+    }
+    c.expect("256-character path is refused", open(&over_limit, O_RDONLY), ENAMETOOLONG);
+    let mut very_long = [0u8; 301];
+    for i in 0..150 {
+        very_long[2 * i] = b'/';
+        very_long[2 * i + 1] = b'a';
+    }
+    c.expect("300-character path is refused", open(&very_long, O_RDONLY), ENAMETOOLONG);
+    let mut long_name = [b'n'; 62];
+    long_name[0] = b'/';
+    long_name[61] = 0;
+    c.expect("name longer than the limit", open(&long_name, O_CREAT | O_RDWR), ENAMETOOLONG);
+
+    // Create, write, seek, read, append, truncate.
+    let f = open(b"/tmp/u.txt\0", O_CREAT | O_RDWR);
+    c.ok("create /tmp/u.txt", f >= 3);
+    c.expect("write", wr(f, b"abc"), 3);
+    c.expect("rewind", lseek(f, 0, SEEK_SET), 0);
+    c.expect("read back", rd(f, &mut buf), 3);
+    c.ok("read-back contents", &buf[..3] == b"abc");
+    c.expect(
+        "exclusive create of an existing file",
+        open(b"/tmp/u.txt\0", O_CREAT | O_EXCL | O_RDWR),
+        EEXIST,
+    );
+    c.expect("close", close(f as u64), 0);
+    let a = open(b"/tmp/u.txt\0", O_WRONLY | O_APPEND);
+    c.expect("append", wr(a, b"def"), 3);
+    c.expect("append again", wr(a, b"g"), 1);
+    c.expect("read from a write-only file", rd(a, &mut buf), EBADF);
+    c.expect("fstat after append", fstat(a, &mut st), 0);
+    c.ok("size is 7", st[2] == 7);
+    c.expect("close", close(a as u64), 0);
+    let t = open(b"/tmp/u.txt\0", O_RDWR | O_TRUNC);
+    c.expect("fstat after truncating open", fstat(t, &mut st), 0);
+    c.ok("size is 0", st[2] == 0);
+    c.expect("close", close(t as u64), 0);
+
+    // A 100 000-byte file written and read in different chunk sizes.
+    let big = open(b"/tmp/big.bin\0", O_CREAT | O_RDWR);
+    let mut chunk = [0u8; 4000];
+    for part in 0..25usize {
+        for (i, byte) in chunk.iter_mut().enumerate() {
+            *byte = ((part * 4000 + i) * 7 + 3) as u8;
+        }
+        c.expect("write 4000 bytes", wr(big, &chunk), 4000);
+    }
+    c.expect("rewind", lseek(big, 0, SEEK_SET), 0);
+    let mut total = 0usize;
+    let mut intact = true;
+    let mut piece = [0u8; 3000];
+    loop {
+        let n = rd(big, &mut piece);
+        if n <= 0 {
+            break;
+        }
+        for (i, &byte) in piece[..n as usize].iter().enumerate() {
+            if byte != ((total + i) * 7 + 3) as u8 {
+                intact = false;
+            }
+        }
+        total += n as usize;
+    }
+    c.ok("100000 bytes came back", total == 100_000);
+    c.ok("100000 bytes are intact", intact);
+    c.expect("close", close(big as u64), 0);
+    c.expect("remove the big file", path_call(SYS_UNLINK, b"/tmp/big.bin\0"), 0);
+
+    // Directories, the working directory, and relative paths.
+    c.expect("mkdir", path_call(SYS_MKDIR, b"/tmp/d1\0"), 0);
+    c.expect("mkdir again", path_call(SYS_MKDIR, b"/tmp/d1\0"), EEXIST);
+    c.expect("mkdir under a missing directory", path_call(SYS_MKDIR, b"/nonexistent/x\0"), ENOENT);
+    c.expect("chdir", path_call(SYS_CHDIR, b"/tmp/d1\0"), 0);
+    let n = unsafe { syscall(SYS_GETCWD, buf.as_mut_ptr() as u64, buf.len() as u64, 0) };
+    c.expect("getcwd length", n, 8);
+    c.ok("getcwd is /tmp/d1", &buf[..8] == b"/tmp/d1\0");
+    let rel = open(b"f.txt\0", O_CREAT | O_RDWR);
+    c.ok("create by relative path", rel >= 3);
+    c.expect("write", wr(rel, b"x"), 1);
+    c.expect("close", close(rel as u64), 0);
+    c.expect("stat absolute", stat(b"/tmp/d1/f.txt\0", &mut st), 0);
+    c.ok("size 1", st[2] == 1);
+    c.expect("stat relative", stat(b"f.txt\0", &mut st), 0);
+    c.expect("stat through ..", stat(b"../d1/f.txt\0", &mut st), 0);
+    c.expect("stat ..", stat(b"..\0", &mut st), 0);
+    c.ok("'..' is a directory", st[1] == 2);
+
+    let dir = open(b".\0", O_RDONLY);
+    c.ok("open the current directory", dir >= 3);
+    let mut entry = [0u8; 88];
+    let (mut count, mut saw_file) = (0, false);
+    while unsafe { syscall(SYS_READDIR, dir as u64, entry.as_mut_ptr() as u64, 0) } == 1 {
+        count += 1;
+        let len = entry[16] as usize;
+        if &entry[24..24 + len] == b"f.txt" {
+            saw_file = true;
+        }
+    }
+    c.ok("readdir finds f.txt", saw_file);
+    c.expect("readdir sees ., .. and f.txt", count, 3);
+    c.expect("read from a directory", rd(dir, &mut buf), EISDIR);
+    c.expect("close", close(dir as u64), 0);
+    c.expect("rmdir of a non-empty directory", path_call(SYS_RMDIR, b"/tmp/d1\0"), ENOTEMPTY);
+
+    // Unlinking a file that is still open keeps it alive until it is closed.
+    let held = open(b"f.txt\0", O_RDONLY);
+    c.expect("unlink while open", path_call(SYS_UNLINK, b"f.txt\0"), 0);
+    c.expect("it is gone by name", stat(b"f.txt\0", &mut st), ENOENT);
+    c.expect("but still readable", rd(held, &mut buf), 1);
+    c.ok("with its contents", buf[0] == b'x');
+    c.expect("close", close(held as u64), 0);
+
+    c.expect("chdir back to the root", path_call(SYS_CHDIR, b"/\0"), 0);
+    let n = unsafe { syscall(SYS_GETCWD, buf.as_mut_ptr() as u64, buf.len() as u64, 0) };
+    c.expect("getcwd of the root", n, 2);
+    c.expect(
+        "getcwd into a buffer that is too small",
+        unsafe { syscall(SYS_GETCWD, buf.as_mut_ptr() as u64, 1, 0) },
+        ERANGE,
+    );
+    c.expect("rmdir", path_call(SYS_RMDIR, b"/tmp/d1\0"), 0);
+    c.expect("rmdir of a file", path_call(SYS_RMDIR, b"/hello.txt\0"), ENOTDIR);
+    c.expect("unlink", path_call(SYS_UNLINK, b"/tmp/u.txt\0"), 0);
+    c.expect("unlink again", path_call(SYS_UNLINK, b"/tmp/u.txt\0"), ENOENT);
+
+    let docs = open(b"/docs\0", O_RDONLY);
+    let file = open(b"/hello.txt\0", O_RDONLY);
+    c.expect(
+        "readdir on a plain file",
+        unsafe { syscall(SYS_READDIR, file as u64, entry.as_mut_ptr() as u64, 0) },
+        ENOTDIR,
+    );
+    c.expect("close", close(docs as u64), 0);
+    c.expect("close", close(file as u64), 0);
+
+    if c.failed == 0 {
+        print("file system call checks passed\n");
+    }
+    exit(c.failed as i64)
 }
 
 /// Reads exactly three bytes from stdin; the kernel sends "abc" once this

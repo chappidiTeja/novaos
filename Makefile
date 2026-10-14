@@ -2,19 +2,27 @@ LIMINE   ?= $(HOME)/os/limine
 KERNEL   := target/x86_64-unknown-none/release/kernel
 ISO      := novaos.iso
 
-USER_ELF := build/hello.elf
+USER_OUT  := user/target/x86_64-unknown-none/release
+USER_ELF  := build/hello.elf
+# Programs that go to /bin on the disk. `hello` is also embedded in the kernel for its tests.
+USER_BINS := hello sh ls cat echo mkdir rm rmdir touch wc cp
+MKFS      := tools/mkfs/target/x86_64-unknown-linux-gnu/release/mkfs
+DISK      := build/disk.img
 
-.PHONY: all user kernel iso run test test-input clean
+# The OS disk: a virtio block device, legacy interface only.
+QEMU_DISK = -drive file=$(1),if=none,id=disk0,format=raw -device virtio-blk-pci,drive=disk0,disable-modern=on
+
+.PHONY: all user kernel iso mkfs rootfs disk run test test-shell test-persistence test-fs clean
 
 all: iso
 
-# The user program is its own crate; the kernel embeds the resulting ELF.
+# User programs are a separate workspace; the kernel embeds `hello` for its tests.
 # RUSTFLAGS replaces (rather than adds to) the kernel's rustflags from .cargo/config.toml.
 user:
 	mkdir -p build
-	cd user/hello && RUSTFLAGS="-Crelocation-model=static -Clink-arg=-Tlinker.ld -Clink-arg=-zmax-page-size=0x1000" \
+	cd user && RUSTFLAGS="-Crelocation-model=static -Clink-arg=-T$(CURDIR)/user/linker.ld -Clink-arg=-zmax-page-size=0x1000" \
 		cargo build --release --target x86_64-unknown-none
-	cp user/hello/target/x86_64-unknown-none/release/hello $(USER_ELF)
+	cp $(USER_OUT)/hello $(USER_ELF)
 
 kernel: user
 	cargo build --release
@@ -35,29 +43,61 @@ iso: kernel $(LIMINE)/limine
 		iso_root -o $(ISO)
 	$(LIMINE)/limine bios-install $(ISO)
 
-# Interactive: serial output goes to this terminal. Quit with Ctrl-A then X.
-run: iso
-	qemu-system-x86_64 -cdrom $(ISO) -m 512M -serial stdio -display none -no-reboot
+# The disk builder runs on the build machine and shares the kernel's filesystem code.
+mkfs:
+	cd tools/mkfs && RUSTFLAGS="" cargo build --release --target x86_64-unknown-linux-gnu
 
-# Non-interactive: boot for a few seconds, then check the serial log.
-test: iso
-	-timeout 25 qemu-system-x86_64 -cdrom $(ISO) -m 512M -serial file:serial.log -display none -no-reboot
+# Stage the files that go on the disk: static ones from rootfs/, plus built programs
+# and a generated test file.
+rootfs: user
+	rm -rf build/rootfs
+	mkdir -p build/rootfs/bin build/rootfs/tmp build/rootfs/var build/rootfs/test build/rootfs/etc build/rootfs/docs
+	cp -r rootfs/. build/rootfs/
+	find build/rootfs -type f \( -name '*.txt' -o -name motd \) -exec sed -i 's/\r$$//' {} +
+	for b in $(USER_BINS); do cp $(USER_OUT)/$$b build/rootfs/bin/$$b; done
+	python3 -c "import sys; sys.stdout.buffer.write(bytes((i ^ (i>>8) ^ (i>>16)) & 255 for i in range(1572864)))" > build/rootfs/test/pattern.bin
+
+disk: mkfs rootfs
+	$(MKFS) $(DISK) build/rootfs --size-mib 64
+
+# Interactive: serial output goes to this terminal. Quit with Ctrl-A then X.
+# Changes made to the disk persist in build/disk-run.img between runs.
+run: iso disk
+	test -f build/disk-run.img || cp $(DISK) build/disk-run.img
+	qemu-system-x86_64 -cdrom $(ISO) -m 512M $(call QEMU_DISK,build/disk-run.img) -serial stdio -display none -no-reboot
+
+# Non-interactive: boot on a fresh copy of the disk, then check the serial log.
+test: iso disk
+	cp $(DISK) build/disk-test.img
+	-timeout 40 qemu-system-x86_64 -cdrom $(ISO) -m 512M $(call QEMU_DISK,build/disk-test.img) -serial file:serial.log -display none -no-reboot
 	@cat serial.log
 	@grep -q "BREAKPOINT" serial.log && grep -q "\[ok\] timer" serial.log \
 		&& grep -q "\[ok\] pmm self-test" serial.log && grep -q "\[ok\] vmm self-test" serial.log \
 		&& grep -q "\[ok\] heap self-test" serial.log \
 		&& grep -q "\[ok\] scheduler self-test" serial.log \
 		&& grep -q "\[ok\] ipc self-test" serial.log \
-		&& grep -q "type a line and press Enter" serial.log \
+		&& grep -q "\[ok\] disk self-test" serial.log \
 		&& grep -q "hello from user mode" serial.log \
 		&& grep -q "\[ok\] user-mode self-test" serial.log \
+		&& grep -q "NovaOS shell" serial.log \
 		&& ! grep -q "KERNEL PANIC" serial.log && echo "TEST PASSED" || (echo "TEST FAILED"; exit 1)
 
-# Types a line into the OS over its serial port and checks the reply.
-test-input: iso
-	bash scripts/serial_input_test.sh $(ISO)
+# Drives the shell over the serial port: runs commands, checks their output, and
+# afterwards checks the disk image they left behind.
+test-shell: iso disk
+	bash scripts/shell_test.sh $(ISO) $(DISK) $(MKFS)
+
+# Boots twice from one disk image: the second boot must see the first one's writes.
+test-persistence: iso disk
+	bash scripts/persistence_test.sh $(ISO) $(DISK) $(MKFS)
+
+# The filesystem's own unit tests, on the build machine.
+test-fs:
+	cd fs && RUSTFLAGS="" cargo test --release --target x86_64-unknown-linux-gnu
 
 clean:
 	cargo clean
-	cd user/hello && cargo clean
+	cd user && cargo clean
+	cd tools/mkfs && cargo clean
+	cd fs && cargo clean
 	rm -rf iso_root build $(ISO) serial.log

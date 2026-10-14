@@ -7,7 +7,7 @@ use core::alloc::{GlobalAlloc, Layout};
 
 /// PML4 slot 384, well clear of the HHDM and the kernel image.
 pub const HEAP_START: u64 = 0xffff_c000_0000_0000;
-pub const HEAP_SIZE: u64 = 4 * 1024 * 1024;
+pub const HEAP_SIZE: u64 = 16 * 1024 * 1024;
 
 /// Every block (and every gap between blocks) is a multiple of this, so a free
 /// block can always hold a FreeNode and no unusably small fragments appear.

@@ -7,19 +7,40 @@
 //!
 //! Numbers: 0 exit(code), 1 write(fd, ptr, len), 2 getpid(), 3 sleep(ticks),
 //!          4 yield(), 5 ticks(), 6 read(fd, ptr, len), 7 pipe(fds_ptr),
-//!          8 close(fd).
+//!          8 close(fd),
+//!          9 open(path, flags), 10 lseek(fd, offset, whence), 11 fstat(fd, out),
+//!          12 stat(path, out), 13 readdir(fd, out), 14 mkdir(path),
+//!          15 unlink(path), 16 rmdir(path), 17 chdir(path), 18 getcwd(buf, len),
+//!          19 spawn(path, argv, argv_len, argc, stdio), 20 waitpid(pid).
 //!
-//! `read` and `write` may sleep (empty/full pipe, no console input). `pipe`
-//! stores the new read and write descriptors as two u64 at `fds_ptr`.
+//! `spawn` loads the ELF program at `path` and starts it as a new process, with
+//! the caller's working directory. `argv` is `argc` NUL-terminated strings back
+//! to back; the program's entry function is called with (argc, pointer to argv).
+//! `stdio` is 0 (the child shares our stdin/stdout/stderr) or points to three
+//! u64 descriptor numbers of this process to use as the child's 0, 1 and 2.
+//! It returns the child's process id; `waitpid` waits for it and returns its exit
+//! status (negative for a process killed by a CPU exception).
+//!
+//! Paths are NUL-terminated strings, at most 255 bytes, absolute or relative to
+//! the process's working directory. `read` and `write` may sleep (empty/full
+//! pipe, no console input, disk I/O). `pipe` stores the new read and write
+//! descriptors as two u64 at `fds_ptr`.
+//!
+//! `fstat`/`stat` fill 5 u64: inode, kind (1 file, 2 directory), size, link count,
+//! blocks. `readdir` fills one 88-byte entry: inode, kind, name length (3 u64),
+//! then the name in 64 bytes; it returns 1 for an entry and 0 at the end.
 
 use crate::gdt::KERNEL_CS;
+use crate::ipc::console;
 use crate::ipc::fd::File;
 use crate::ipc::pipe::{self, BrokenPipe};
-use crate::ipc::console;
 use crate::mem::vmm;
+use crate::vfs;
 use crate::{proc, sched, serial, timer};
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::arch::{asm, global_asm};
+use novafs::{FileKind, Stat};
 
 const SYS_EXIT: u64 = 0;
 const SYS_WRITE: u64 = 1;
@@ -30,6 +51,23 @@ const SYS_TICKS: u64 = 5;
 const SYS_READ: u64 = 6;
 const SYS_PIPE: u64 = 7;
 const SYS_CLOSE: u64 = 8;
+const SYS_OPEN: u64 = 9;
+const SYS_LSEEK: u64 = 10;
+const SYS_FSTAT: u64 = 11;
+const SYS_STAT: u64 = 12;
+const SYS_READDIR: u64 = 13;
+const SYS_MKDIR: u64 = 14;
+const SYS_UNLINK: u64 = 15;
+const SYS_RMDIR: u64 = 16;
+const SYS_CHDIR: u64 = 17;
+const SYS_GETCWD: u64 = 18;
+const SYS_SPAWN: u64 = 19;
+const SYS_WAITPID: u64 = 20;
+
+const E2BIG: i64 = -7;
+const ENOEXEC: i64 = -8;
+const ECHILD: i64 = -10;
+const ENOMEM: i64 = -12;
 
 const EBADF: i64 = -9;
 const EFAULT: i64 = -14;
@@ -38,8 +76,11 @@ const EINVAL: i64 = -22;
 const EPIPE: i64 = -32;
 const ENOSYS: i64 = -38;
 
+/// Longest path accepted from user space.
+const PATH_MAX: usize = 255;
+
 /// Largest single read or write we are willing to buffer in the kernel.
-const MAX_IO: u64 = 4096;
+const MAX_IO: u64 = 65536;
 const MAX_SLEEP_TICKS: u64 = 1000;
 
 const MSR_EFER: u32 = 0xC000_0080;
@@ -125,13 +166,25 @@ pub fn set_kernel_stack(top: u64) {
     unsafe { core::ptr::addr_of_mut!(KERNEL_RSP).write_volatile(top) };
 }
 
-extern "C" fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64 {
+extern "C" fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64 {
     match nr {
+        SYS_SPAWN => sys_spawn(a1, a2, a3, a4, a5),
+        SYS_WAITPID => sys_waitpid(a1),
         SYS_EXIT => proc::exit_current(a1 as i64),
         SYS_WRITE => sys_write(a1, a2, a3),
         SYS_READ => sys_read(a1, a2, a3),
         SYS_PIPE => sys_pipe(a1),
         SYS_CLOSE => sys_close(a1),
+        SYS_OPEN => sys_open(a1, a2),
+        SYS_LSEEK => sys_lseek(a1, a2 as i64, a3),
+        SYS_FSTAT => sys_fstat(a1, a2),
+        SYS_STAT => sys_stat(a1, a2),
+        SYS_READDIR => sys_readdir(a1, a2),
+        SYS_MKDIR => sys_path_op(a1, vfs::mkdir),
+        SYS_UNLINK => sys_path_op(a1, vfs::unlink),
+        SYS_RMDIR => sys_path_op(a1, vfs::rmdir),
+        SYS_CHDIR => sys_chdir(a1),
+        SYS_GETCWD => sys_getcwd(a1, a2),
         SYS_GETPID => proc::current_pid() as i64,
         SYS_SLEEP => {
             sched::sleep_ticks(a1.min(MAX_SLEEP_TICKS));
@@ -174,6 +227,10 @@ fn sys_write(fd: u64, ptr: u64, len: u64) -> i64 {
             Err(BrokenPipe) => EPIPE,
         },
         File::PipeRead(_) => EBADF,
+        File::Disk(file) => match file.write(&bytes) {
+            Ok(n) => n as i64,
+            Err(e) => e,
+        },
     }
 }
 
@@ -198,9 +255,288 @@ fn sys_read(fd: u64, ptr: u64, len: u64) -> i64 {
         File::Console => console::read(&mut buf),
         File::PipeRead(pipe) => pipe.read(&mut buf),
         File::PipeWrite(_) => return EBADF,
+        File::Disk(file) => match file.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) => return e,
+        },
     };
     match copy_to_user(ptr, &buf[..n]) {
         Ok(()) => n as i64,
+        Err(e) => e,
+    }
+}
+
+// ---- files and directories --------------------------------------------------------
+
+/// A NUL-terminated string from user space.
+fn copy_cstr_from_user(ptr: u64, max: usize) -> Result<String, i64> {
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut addr = ptr;
+    while bytes.len() <= max {
+        let in_page = (0x1000 - (addr & 0xFFF)) as usize;
+        let chunk = in_page.min(max + 1 - bytes.len());
+        let mut terminated = false;
+        walk_user(addr, chunk as u64, false, |src, n| {
+            let piece = unsafe { core::slice::from_raw_parts(src, n) };
+            match piece.iter().position(|&b| b == 0) {
+                Some(end) => {
+                    bytes.extend_from_slice(&piece[..end]);
+                    terminated = true;
+                }
+                None => bytes.extend_from_slice(piece),
+            }
+        })?;
+        if terminated {
+            return String::from_utf8(bytes).map_err(|_| EINVAL);
+        }
+        addr += chunk as u64;
+    }
+    Err(vfs::ENAMETOOLONG)
+}
+
+fn user_path(ptr: u64) -> Result<String, i64> {
+    copy_cstr_from_user(ptr, PATH_MAX)
+}
+
+fn cwd_ino() -> u32 {
+    proc::current_cwd().map_or(novafs::ROOT_INO, |c| c.lock().ino)
+}
+
+fn sys_open(path_ptr: u64, flags: u64) -> i64 {
+    let path = match user_path(path_ptr) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let file = match vfs::open(&path, flags, cwd_ino()) {
+        Ok(f) => f,
+        Err(e) => return e,
+    };
+    let fds = match proc::current_fds() {
+        Some(fds) => fds,
+        None => return EBADF,
+    };
+    let installed = fds.lock().install(File::Disk(file));
+    match installed {
+        Some(fd) => fd as i64,
+        None => EMFILE, // the closure moved `file` in and dropped it: its release is queued
+    }
+}
+
+fn sys_lseek(fd: u64, offset: i64, whence: u64) -> i64 {
+    match lookup_fd(fd).as_deref() {
+        Some(File::Disk(file)) => match file.seek(offset, whence) {
+            Ok(pos) => pos as i64,
+            Err(e) => e,
+        },
+        Some(_) => -29, // ESPIPE: pipes and the console cannot seek
+        None => EBADF,
+    }
+}
+
+fn kind_code(kind: FileKind) -> u64 {
+    match kind {
+        FileKind::File => 1,
+        FileKind::Dir => 2,
+    }
+}
+
+fn store_stat(out_ptr: u64, stat: &Stat) -> i64 {
+    let mut raw = [0u8; 40];
+    for (i, value) in [
+        stat.ino as u64,
+        kind_code(stat.kind),
+        stat.size,
+        stat.nlink as u64,
+        stat.blocks as u64,
+    ]
+    .iter()
+    .enumerate()
+    {
+        raw[8 * i..8 * i + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    match copy_to_user(out_ptr, &raw) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+fn sys_fstat(fd: u64, out_ptr: u64) -> i64 {
+    match lookup_fd(fd).as_deref() {
+        Some(File::Disk(file)) => match file.stat() {
+            Ok(stat) => store_stat(out_ptr, &stat),
+            Err(e) => e,
+        },
+        Some(_) => {
+            // Not a disk file: report an empty regular file.
+            let stat = Stat { ino: 0, kind: FileKind::File, size: 0, nlink: 1, blocks: 0 };
+            store_stat(out_ptr, &stat)
+        }
+        None => EBADF,
+    }
+}
+
+fn sys_stat(path_ptr: u64, out_ptr: u64) -> i64 {
+    let path = match user_path(path_ptr) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    match vfs::stat_path(&path, cwd_ino()) {
+        Ok(stat) => store_stat(out_ptr, &stat),
+        Err(e) => e,
+    }
+}
+
+fn sys_readdir(fd: u64, out_ptr: u64) -> i64 {
+    let file = match lookup_fd(fd) {
+        Some(file) => file,
+        None => return EBADF,
+    };
+    let File::Disk(dir) = &*file else {
+        return vfs::ENOTDIR;
+    };
+    if let Err(e) = walk_user(out_ptr, 88, true, |_, _| {}) {
+        return e;
+    }
+    match dir.next_entry() {
+        Err(e) => e,
+        Ok(None) => 0,
+        Ok(Some(entry)) => {
+            let mut raw = [0u8; 88];
+            raw[0..8].copy_from_slice(&(entry.ino as u64).to_le_bytes());
+            raw[8..16].copy_from_slice(&kind_code(entry.kind).to_le_bytes());
+            raw[16..24].copy_from_slice(&(entry.name().len() as u64).to_le_bytes());
+            raw[24..24 + entry.name().len()].copy_from_slice(entry.name());
+            match copy_to_user(out_ptr, &raw) {
+                Ok(()) => 1,
+                Err(e) => e,
+            }
+        }
+    }
+}
+
+/// mkdir, unlink and rmdir all take one path.
+fn sys_path_op(path_ptr: u64, op: fn(&str, u32) -> Result<(), i64>) -> i64 {
+    let path = match user_path(path_ptr) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    match op(&path, cwd_ino()) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+fn sys_spawn(path_ptr: u64, argv_ptr: u64, argv_len: u64, argc: u64, stdio_ptr: u64) -> i64 {
+    let path = match user_path(path_ptr) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    if argv_len as usize > proc::MAX_ARGV_BYTES || argc > 64 {
+        return E2BIG;
+    }
+    let argv = match copy_from_user(argv_ptr, argv_len) {
+        Ok(bytes) => bytes,
+        Err(e) => return e,
+    };
+    // The block must hold exactly `argc` complete strings.
+    if argv.iter().filter(|&&b| b == 0).count() != argc as usize
+        || (argc > 0 && argv.last() != Some(&0))
+    {
+        return EINVAL;
+    }
+
+    // Which of our descriptors become the child's stdin, stdout and stderr.
+    let mapping: [u64; 3] = if stdio_ptr == 0 {
+        [0, 1, 2]
+    } else {
+        match copy_from_user(stdio_ptr, 24) {
+            Ok(raw) => {
+                let word = |i: usize| u64::from_le_bytes(raw[8 * i..8 * i + 8].try_into().unwrap());
+                [word(0), word(1), word(2)]
+            }
+            Err(e) => return e,
+        }
+    };
+    let parent_fds = match proc::current_fds() {
+        Some(fds) => fds,
+        None => return EBADF,
+    };
+    let files = {
+        let table = parent_fds.lock();
+        [table.get(mapping[0]), table.get(mapping[1]), table.get(mapping[2])]
+    };
+    let mut child_fds = crate::ipc::fd::FdTable::empty();
+    for (i, file) in files.into_iter().enumerate() {
+        match file {
+            Some(file) => child_fds.share(i, file),
+            None => return EBADF,
+        }
+    }
+
+    let cwd = match proc::current_cwd() {
+        Some(cwd) => cwd.lock().clone(),
+        None => return EBADF,
+    };
+    let image = match vfs::read_file(&path, cwd.ino, 4 << 20) {
+        Ok(image) => image,
+        Err(e) => return e,
+    };
+    let name = path.rsplit('/').next().unwrap_or("proc");
+    match proc::spawn_user_in(name, &image, 0, child_fds, cwd, &argv, argc as usize) {
+        Ok(handle) => {
+            let pid = handle.pid as i64;
+            proc::register_child(handle);
+            pid
+        }
+        Err(proc::SpawnError::OutOfMemory) => ENOMEM,
+        Err(proc::SpawnError::Elf(_)) => ENOEXEC,
+        Err(proc::SpawnError::BadArguments) => E2BIG,
+    }
+}
+
+fn sys_waitpid(pid: u64) -> i64 {
+    match proc::take_child(pid) {
+        Some(handle) => proc::wait_forever(&handle),
+        None => ECHILD,
+    }
+}
+
+fn sys_chdir(path_ptr: u64) -> i64 {
+    let path = match user_path(path_ptr) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let cwd = match proc::current_cwd() {
+        Some(cwd) => cwd,
+        None => return EBADF,
+    };
+    let (current_ino, current_path) = {
+        let guard = cwd.lock();
+        (guard.ino, guard.path.clone())
+    };
+    let ino = match vfs::resolve_dir(&path, current_ino) {
+        Ok(ino) => ino,
+        Err(e) => return e,
+    };
+    let mut guard = cwd.lock();
+    guard.ino = ino;
+    guard.path = vfs::normalize(&current_path, &path);
+    0
+}
+
+fn sys_getcwd(buf_ptr: u64, len: u64) -> i64 {
+    let path = match proc::current_cwd() {
+        Some(cwd) => cwd.lock().path.clone(),
+        None => return EBADF,
+    };
+    let needed = path.len() as u64 + 1;
+    if needed > len {
+        return vfs::ERANGE;
+    }
+    let mut raw = path.into_bytes();
+    raw.push(0);
+    match copy_to_user(buf_ptr, &raw) {
+        Ok(()) => needed as i64,
         Err(e) => e,
     }
 }
@@ -250,6 +586,8 @@ fn sys_close(fd: u64) -> i64 {
     match file {
         Some(file) => {
             drop(file);
+            // A disk file that was unlinked while open is freed by this.
+            vfs::flush_pending();
             0
         }
         None => EBADF,

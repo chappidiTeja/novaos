@@ -1,6 +1,7 @@
 //! Per-process file descriptor table.
 
 use super::pipe::{PipeReader, PipeWriter};
+use crate::vfs::DiskFile;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -12,6 +13,8 @@ pub enum File {
     Console,
     PipeRead(PipeReader),
     PipeWrite(PipeWriter),
+    /// A file or directory on the disk.
+    Disk(DiskFile),
 }
 
 pub struct FdTable {
@@ -26,6 +29,17 @@ impl FdTable {
             files[fd] = Some(Arc::new(File::Console));
         }
         FdTable { files }
+    }
+
+    /// A table with nothing open.
+    pub fn empty() -> Self {
+        FdTable { files: alloc::vec![None; MAX_FDS] }
+    }
+
+    /// Make `fd` refer to the same open file as `file` (like dup): the position
+    /// of a disk file, and the open pipe end, are shared.
+    pub fn share(&mut self, fd: usize, file: Arc<File>) {
+        self.files[fd] = Some(file);
     }
 
     pub fn get(&self, fd: u64) -> Option<Arc<File>> {

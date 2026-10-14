@@ -1,0 +1,22 @@
+# All NovaOS user programs. One workspace so they share a target directory and
+# the `nova` support library.
+[workspace]
+resolver = "2"
+members = [
+    "lib",
+    "hello",
+    "sh",
+    "ls",
+    "cat",
+    "echo",
+    "mkdir",
+    "rm",
+    "rmdir",
+    "touch",
+    "wc",
+    "cp",
+]
+
+[profile.release]
+panic = "abort"
+opt-level = 2

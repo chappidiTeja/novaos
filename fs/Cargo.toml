@@ -1,0 +1,12 @@
+[package]
+name = "novafs"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone crate: used by the kernel (no_std) and by host tools and tests.
+[workspace]
+
+[dependencies]
+
+[profile.release]
+panic = "abort"

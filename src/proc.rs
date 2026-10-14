@@ -10,7 +10,9 @@ use crate::ipc::pipe;
 use crate::ipc::waitq::WaitQueue;
 use crate::mem::{pmm, vmm, PAGE_SIZE};
 use crate::sync::SpinLock;
+use crate::vfs::Cwd;
 use crate::{elf, println, sched, timer};
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -67,17 +69,25 @@ pub struct UserProc {
     pub space: AddressSpace,
     pub entry: u64,
     pub rsp: u64,
+    /// First two arguments of the entry function (rdi, rsi).
     pub arg: u64,
+    pub arg1: u64,
     pub handle: Arc<ProcHandle>,
     /// Shared so system calls can use it without holding the scheduler's data.
     pub fds: Arc<SpinLock<FdTable>>,
+    pub cwd: Arc<SpinLock<Cwd>>,
 }
 
 #[derive(Debug)]
 pub enum SpawnError {
     OutOfMemory,
     Elf(elf::ElfError),
+    /// The command-line arguments do not fit.
+    BadArguments,
 }
+
+/// Largest argument block (all argument strings together) a process can be given.
+pub const MAX_ARGV_BYTES: usize = 2048;
 
 impl From<elf::ElfError> for SpawnError {
     fn from(e: elf::ElfError) -> Self {
@@ -88,7 +98,7 @@ impl From<elf::ElfError> for SpawnError {
 /// Create a process from an ELF image with stdin/stdout/stderr on the console,
 /// and start it. `arg` arrives in rdi.
 pub fn spawn_user(
-    name: &'static str,
+    name: &str,
     image: &[u8],
     arg: u64,
 ) -> Result<Arc<ProcHandle>, SpawnError> {
@@ -98,17 +108,37 @@ pub fn spawn_user(
 /// Like `spawn_user`, with a caller-prepared descriptor table (to hand the
 /// process pipe ends, for example).
 pub fn spawn_user_with(
-    name: &'static str,
+    name: &str,
     image: &[u8],
     arg: u64,
     fds: FdTable,
 ) -> Result<Arc<ProcHandle>, SpawnError> {
+    spawn_user_in(name, image, arg, fds, Cwd::root(), &[], 0)
+}
+
+/// The full form: descriptors and working directory chosen by the caller, and
+/// optionally a command line. `argv` is `argc` NUL-terminated strings back to
+/// back; it is copied to the top of the new process's stack, and the entry
+/// function receives `(argc, pointer to argv)`. With no `argv` it receives `arg`.
+pub fn spawn_user_in(
+    name: &str,
+    image: &[u8],
+    arg: u64,
+    fds: FdTable,
+    cwd: Cwd,
+    argv: &[u8],
+    argc: usize,
+) -> Result<Arc<ProcHandle>, SpawnError> {
+    if argv.len() > MAX_ARGV_BYTES || (argc > 0 && argv.last() != Some(&0)) {
+        return Err(SpawnError::BadArguments);
+    }
     let pml4 = vmm::new_address_space().ok_or(SpawnError::OutOfMemory)?;
     // From here on, dropping `space` releases everything mapped so far.
     let space = AddressSpace { pml4 };
 
     let entry = elf::load(pml4, image)?;
 
+    let mut top_frame = 0;
     for i in 1..=USER_STACK_PAGES {
         let frame = pmm::alloc_zeroed_frame().ok_or(SpawnError::OutOfMemory)?;
         let flags = vmm::user_flags(true, false);
@@ -116,7 +146,26 @@ pub fn spawn_user_with(
             pmm::free_frame(frame);
             return Err(SpawnError::OutOfMemory);
         }
+        if i == 1 {
+            top_frame = frame;
+        }
     }
+
+    // The compiler expects rsp = 8 mod 16 on function entry.
+    let (rsp, arg0, arg1) = if argv.is_empty() {
+        (USER_STACK_TOP - 8, arg, 0)
+    } else {
+        let reserved = crate::mem::align_up(argv.len() as u64, 16);
+        let argv_user = USER_STACK_TOP - reserved;
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                argv.as_ptr(),
+                crate::mem::phys_to_virt(top_frame + PAGE_SIZE - reserved),
+                argv.len(),
+            );
+        }
+        (argv_user - 8, argc as u64, argv_user)
+    };
 
     let handle = Arc::new(ProcHandle {
         pid: NEXT_PID.fetch_add(1, Ordering::Relaxed),
@@ -129,14 +178,48 @@ pub fn spawn_user_with(
         UserProc {
             space,
             entry,
-            // The compiler expects rsp = 8 mod 16 on function entry.
-            rsp: USER_STACK_TOP - 8,
-            arg,
+            rsp,
+            arg: arg0,
+            arg1,
             handle: handle.clone(),
             fds: Arc::new(SpinLock::new(fds)),
+            cwd: Arc::new(SpinLock::new(cwd)),
         },
     );
     Ok(handle)
+}
+
+/// Processes started by system calls, until someone waits for them.
+static CHILDREN: SpinLock<BTreeMap<u64, Arc<ProcHandle>>> = SpinLock::new(BTreeMap::new());
+
+pub fn register_child(handle: Arc<ProcHandle>) {
+    CHILDREN.lock().insert(handle.pid, handle);
+}
+
+pub fn take_child(pid: u64) -> Option<Arc<ProcHandle>> {
+    CHILDREN.lock().remove(&pid)
+}
+
+/// Sleep until the process finishes, however long that takes.
+pub fn wait_forever(handle: &ProcHandle) -> i64 {
+    handle.finished.wait_until(|| handle.done.load(Ordering::Acquire));
+    handle.exit_code().unwrap_or(0)
+}
+
+/// Start the first user program: the shell from the disk. False if there is no
+/// disk or no shell on it.
+pub fn spawn_init() -> bool {
+    let image = match crate::vfs::read_file("/bin/sh", novafs::ROOT_INO, 4 << 20) {
+        Ok(image) => image,
+        Err(_) => return false,
+    };
+    match spawn_user_in("sh", &image, 0, FdTable::with_stdio(), Cwd::root(), b"sh\0", 1) {
+        Ok(_) => true,
+        Err(e) => {
+            println!("[init] could not start /bin/sh: {:?}", e);
+            false
+        }
+    }
 }
 
 /// Sleep until the process finishes, or `timeout_ticks` pass.
@@ -155,6 +238,11 @@ pub fn current_pid() -> u64 {
 /// The calling process's descriptor table.
 pub fn current_fds() -> Option<Arc<SpinLock<FdTable>>> {
     sched::with_current_user(|u| u.fds.clone())
+}
+
+/// The calling process's working directory.
+pub fn current_cwd() -> Option<Arc<SpinLock<Cwd>>> {
+    sched::with_current_user(|u| u.cwd.clone())
 }
 
 /// Close every descriptor (so pipe peers see EOF) and publish the exit status.
@@ -189,15 +277,16 @@ pub fn kill_current(what: &str, vector: u8, rip: u64) -> ! {
 
 /// Entry function of a user process's kernel thread: drop to ring 3.
 pub fn user_thread_main() {
-    let (entry, rsp, arg) = sched::with_current_user(|u| (u.entry, u.rsp, u.arg))
+    let (entry, rsp, arg, arg1) = sched::with_current_user(|u| (u.entry, u.rsp, u.arg, u.arg1))
         .expect("user_thread_main on a thread without a process");
-    unsafe { enter_usermode(entry, rsp, arg) }
+    unsafe { enter_usermode(entry, rsp, arg, arg1) }
 }
 
 extern "C" {
-    /// Build an iretq frame for ring 3 and jump: rdi = rip, rsi = rsp, rdx = arg
-    /// (delivered in rdi). All other registers are cleared.
-    fn enter_usermode(rip: u64, rsp: u64, arg: u64) -> !;
+    /// Build an iretq frame for ring 3 and jump: rdi = rip, rsi = rsp, rdx = first
+    /// argument (delivered in rdi), rcx = second argument (delivered in rsi).
+    /// All other registers are cleared.
+    fn enter_usermode(rip: u64, rsp: u64, arg: u64, arg1: u64) -> !;
 }
 
 global_asm!(
@@ -209,11 +298,11 @@ global_asm!(
     "push {user_cs}",
     "push rdi",
     "mov rdi, rdx",
+    "mov rsi, rcx",
     "xor eax, eax",
     "xor ebx, ebx",
     "xor ecx, ecx",
     "xor edx, edx",
-    "xor esi, esi",
     "xor ebp, ebp",
     "xor r8d, r8d",
     "xor r9d, r9d",
@@ -249,6 +338,23 @@ pub fn self_test() {
         let code = wait(&handle, 500).unwrap_or_else(|| panic!("process {} timed out", name));
         assert_eq!(code, expect, "process {} ended with the wrong status", name);
         println!("[ok] user: {} -> {}", name, code);
+    }
+
+    // File system calls from user mode. Run first: the block cache fills as the
+    // disk is used, which would look like a leak in the measurements below.
+    if crate::vfs::is_mounted() {
+        let before = crate::vfs::with_fs(|fs| fs.statfs()).expect("filesystem vanished");
+        run("fs-syscalls", 16, 0);
+        crate::vfs::flush_pending(); // frees files that were unlinked while open
+        let after = crate::vfs::with_fs(|fs| {
+            fs.check().expect("filesystem inconsistent after the user-mode test");
+            fs.statfs()
+        })
+        .expect("filesystem vanished");
+        assert_eq!(after, before, "file system calls leaked blocks or inodes");
+        println!("[ok] user: file system calls work, and leave the disk as they found it");
+    } else {
+        println!("[skip] user: no disk, file system call tests not run");
     }
 
     sched::sleep_ticks(10); // let earlier threads be reaped before measuring

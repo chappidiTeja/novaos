@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# The filesystem is its own no_std crate so it can also be tested on the host.
+novafs = { path = "fs" }
 
 [profile.dev]
 panic = "abort"

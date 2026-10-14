@@ -3,11 +3,4 @@ name = "hello"
 version = "0.1.0"
 edition = "2021"
 
-# Not part of the kernel's build: this is its own root.
-[workspace]
-
 [dependencies]
-
-[profile.release]
-panic = "abort"
-opt-level = 2

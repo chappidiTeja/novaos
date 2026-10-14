@@ -1,0 +1,3 @@
+1. Boot.
+2. Mount the disk.
+3. Run a shell.

@@ -9,6 +9,7 @@ use crate::proc::{ProcHandle, UserProc};
 use crate::sync::{irq_restore, irq_save, IrqCell};
 use crate::{gdt, println, syscall, timer};
 use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -34,7 +35,7 @@ enum State {
 }
 
 struct Thread {
-    name: &'static str,
+    name: String,
     /// Saved stack pointer while the thread is not running.
     rsp: u64,
     state: State,
@@ -85,6 +86,11 @@ static SCHED: IrqCell<Sched> = IrqCell::new(Sched {
 });
 
 static STARTED: AtomicBool = AtomicBool::new(false);
+
+/// True once `init` has run, i.e. blocking and yielding are possible.
+pub fn started() -> bool {
+    STARTED.load(Ordering::Acquire)
+}
 
 extern "C" {
     /// Save callee-saved registers on the current stack, store the stack pointer
@@ -233,7 +239,7 @@ fn schedule() {
 }
 
 /// Build a thread whose first switch-in runs `entry` on a fresh stack.
-fn new_thread(name: &'static str, entry: fn()) -> Box<Thread> {
+fn new_thread(name: &str, entry: fn()) -> Box<Thread> {
     let mut stack = alloc::vec![0u8; STACK_SIZE];
     let top = (stack.as_mut_ptr() as usize + STACK_SIZE) & !15;
     // Seven words that `switch_context` will pop: r15 r14 r13 r12 rbx rbp, then
@@ -246,7 +252,7 @@ fn new_thread(name: &'static str, entry: fn()) -> Box<Thread> {
         frame.add(6).write(thread_trampoline as *const () as usize as u64);
     }
     Box::new(Thread {
-        name,
+        name: String::from(name),
         rsp: sp as u64,
         state: State::Ready,
         wake_at: 0,
@@ -267,7 +273,7 @@ fn idle_main() {
 /// thread. Interrupts must be enabled afterwards for preemption to happen.
 pub fn init() {
     let main = Box::new(Thread {
-        name: "main",
+        name: String::from("main"),
         rsp: 0,
         state: State::Running,
         wake_at: 0,
@@ -292,7 +298,7 @@ pub fn init() {
 }
 
 /// Start a new thread running `entry`; returns its id.
-pub fn spawn(name: &'static str, entry: fn()) -> usize {
+pub fn spawn(name: &str, entry: fn()) -> usize {
     let thread = new_thread(name, entry);
     SCHED.with(|s| {
         let id = s.add(thread);
@@ -302,7 +308,7 @@ pub fn spawn(name: &'static str, entry: fn()) -> usize {
 }
 
 /// Start a thread that runs `proc` in ring 3, with its own address space.
-pub fn spawn_user(name: &'static str, proc: UserProc) -> usize {
+pub fn spawn_user(name: &str, proc: UserProc) -> usize {
     let mut thread = new_thread(name, crate::proc::user_thread_main);
     thread.cr3 = proc.space.pml4;
     thread.user = Some(proc);
@@ -425,10 +431,10 @@ pub fn current_id() -> usize {
     SCHED.with(|s| s.current)
 }
 
-pub fn current_name() -> &'static str {
+pub fn current_name() -> String {
     SCHED.with(|s| {
         let id = s.current;
-        s.thread(id).name
+        s.thread(id).name.clone()
     })
 }
 
