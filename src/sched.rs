@@ -4,11 +4,13 @@
 //! time slice is used up, switches to the next ready thread. Threads can also
 //! give up the CPU themselves with `yield_now` and `sleep_ticks`.
 
-use crate::mem::heap;
+use crate::mem::{heap, vmm};
+use crate::proc::{ProcHandle, UserProc};
 use crate::sync::{irq_restore, irq_save, IrqCell};
-use crate::{println, timer};
+use crate::{gdt, println, syscall, timer};
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::arch::{asm, global_asm};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -33,8 +35,23 @@ struct Thread {
     rsp: u64,
     state: State,
     wake_at: u64,
+    /// Page tables to load when this thread runs (the kernel's, or its process's).
+    cr3: u64,
+    /// Top of this thread's kernel stack: where ring-3 interrupts and system
+    /// calls land. 0 for the boot thread, which never runs user code.
+    kstack_top: u64,
+    /// Set if this thread is the body of a user process.
+    user: Option<UserProc>,
     /// Owns the thread's stack memory.
     _stack: Vec<u8>,
+}
+
+/// What `schedule` has to do to move from one thread to the next.
+struct Switch {
+    save: *mut u64,
+    to: u64,
+    cr3: u64,
+    kstack_top: u64,
 }
 
 struct Sched {
@@ -125,9 +142,8 @@ impl Sched {
         id
     }
 
-    /// Choose the next thread. Returns where to save the outgoing stack pointer
-    /// and the incoming one, or None if the current thread keeps running.
-    fn pick_next(&mut self) -> Option<(*mut u64, u64)> {
+    /// Choose the next thread, or None if the current thread keeps running.
+    fn pick_next(&mut self) -> Option<Switch> {
         let mut i = 0;
         while i < self.zombies.len() {
             let id = self.zombies[i];
@@ -158,16 +174,28 @@ impl Sched {
         self.current = next;
         self.switches += 1;
         let save = &mut self.thread(old).rsp as *mut u64;
-        let to = self.thread(next).rsp;
-        Some((save, to))
+        let incoming = self.thread(next);
+        Some(Switch {
+            save,
+            to: incoming.rsp,
+            cr3: incoming.cr3,
+            kstack_top: incoming.kstack_top,
+        })
     }
 }
 
 /// Switch to the next thread. Must be called with interrupts disabled.
 fn schedule() {
     let switch = SCHED.with(|s| s.pick_next());
-    if let Some((save, to)) = switch {
-        unsafe { switch_context(save, to) };
+    if let Some(sw) = switch {
+        // The kernel half is identical in every address space, so it is safe to
+        // change page tables while still running on the outgoing thread's stack.
+        if sw.cr3 != vmm::read_cr3() {
+            vmm::activate(sw.cr3);
+        }
+        gdt::set_kernel_stack(sw.kstack_top);
+        syscall::set_kernel_stack(sw.kstack_top);
+        unsafe { switch_context(sw.save, sw.to) };
     }
 }
 
@@ -189,6 +217,9 @@ fn new_thread(name: &'static str, entry: fn()) -> Box<Thread> {
         rsp: sp as u64,
         state: State::Ready,
         wake_at: 0,
+        cr3: vmm::kernel_cr3(),
+        kstack_top: top as u64,
+        user: None,
         _stack: stack,
     })
 }
@@ -207,6 +238,9 @@ pub fn init() {
         rsp: 0,
         state: State::Running,
         wake_at: 0,
+        cr3: vmm::kernel_cr3(),
+        kstack_top: 0,
+        user: None,
         _stack: Vec::new(),
     });
     let idle = new_thread("idle", idle_main);
@@ -232,6 +266,30 @@ pub fn spawn(name: &'static str, entry: fn()) -> usize {
         s.ready.push_back(id);
         id
     })
+}
+
+/// Start a thread that runs `proc` in ring 3, with its own address space.
+pub fn spawn_user(name: &'static str, proc: UserProc) -> usize {
+    let mut thread = new_thread(name, crate::proc::user_thread_main);
+    thread.cr3 = proc.space.pml4;
+    thread.user = Some(proc);
+    SCHED.with(|s| {
+        let id = s.add(thread);
+        s.ready.push_back(id);
+        id
+    })
+}
+
+/// Run `f` on the current thread's process, if it has one.
+pub fn with_current_user<R>(f: impl FnOnce(&UserProc) -> R) -> Option<R> {
+    SCHED.with(|s| {
+        let id = s.current;
+        s.thread(id).user.as_ref().map(f)
+    })
+}
+
+pub fn current_user_handle() -> Option<Arc<ProcHandle>> {
+    with_current_user(|u| u.handle.clone())
 }
 
 /// Called from the timer interrupt (interrupts are off, EOI already sent).

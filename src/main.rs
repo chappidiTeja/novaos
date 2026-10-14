@@ -4,6 +4,7 @@
 
 extern crate alloc;
 
+mod elf;
 mod gdt;
 mod idt;
 mod keyboard;
@@ -11,9 +12,11 @@ mod limine;
 mod mem;
 mod pic;
 mod port;
+mod proc;
 mod sched;
 mod serial;
 mod sync;
+mod syscall;
 mod timer;
 
 use core::arch::asm;
@@ -66,6 +69,10 @@ extern "C" fn _start() -> ! {
     sched::init();
     println!("[ok] scheduler: main + idle threads");
     sched::self_test();
+
+    syscall::init();
+    println!("[ok] syscall interface enabled");
+    proc::self_test();
 
     println!("Type on the keyboard:");
     loop {

@@ -85,7 +85,12 @@ pub fn init() {
     }
 }
 
-fn fatal(name: &str, frame: &InterruptStackFrame, error_code: Option<u64>) -> ! {
+/// An exception we cannot recover from. If it came from ring 3 only that process
+/// is terminated; if it came from the kernel itself, the machine stops.
+fn fatal(name: &str, vector: u8, frame: &InterruptStackFrame, error_code: Option<u64>) -> ! {
+    if frame.cs & 3 == 3 {
+        crate::proc::kill_current(name, vector, frame.rip);
+    }
     crate::serial::force_unlock();
     println!("\n*** EXCEPTION: {} ***", name);
     if let Some(code) = error_code {
@@ -99,7 +104,7 @@ fn fatal(name: &str, frame: &InterruptStackFrame, error_code: Option<u64>) -> ! 
 }
 
 extern "x86-interrupt" fn divide_error(frame: InterruptStackFrame) {
-    fatal("DIVIDE ERROR (#DE)", &frame, None)
+    fatal("DIVIDE ERROR (#DE)", 0, &frame, None)
 }
 
 extern "x86-interrupt" fn breakpoint(frame: InterruptStackFrame) {
@@ -107,22 +112,32 @@ extern "x86-interrupt" fn breakpoint(frame: InterruptStackFrame) {
 }
 
 extern "x86-interrupt" fn invalid_opcode(frame: InterruptStackFrame) {
-    fatal("INVALID OPCODE (#UD)", &frame, None)
+    fatal("INVALID OPCODE (#UD)", 6, &frame, None)
 }
 
 extern "x86-interrupt" fn double_fault(frame: InterruptStackFrame, code: u64) -> ! {
-    fatal("DOUBLE FAULT (#DF)", &frame, Some(code))
+    // Runs on its own IST stack and is never attributed to a process.
+    crate::serial::force_unlock();
+    println!("\n*** EXCEPTION: DOUBLE FAULT (#DF) ***");
+    println!("error code: {:#x}", code);
+    println!(
+        "rip={:#x} cs={:#x} rflags={:#x} rsp={:#x} ss={:#x}",
+        frame.rip, frame.cs, frame.rflags, frame.rsp, frame.ss
+    );
+    crate::halt_forever()
 }
 
 extern "x86-interrupt" fn general_protection(frame: InterruptStackFrame, code: u64) {
-    fatal("GENERAL PROTECTION FAULT (#GP)", &frame, Some(code))
+    fatal("GENERAL PROTECTION FAULT (#GP)", 13, &frame, Some(code))
 }
 
 extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: u64) {
     let cr2: u64;
     unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags)) };
-    println!("faulting address (CR2): {:#x}", cr2);
-    fatal("PAGE FAULT (#PF)", &frame, Some(code))
+    if frame.cs & 3 != 3 {
+        println!("faulting address (CR2): {:#x}", cr2);
+    }
+    fatal("PAGE FAULT (#PF)", 14, &frame, Some(code))
 }
 
 extern "x86-interrupt" fn timer_irq(_frame: InterruptStackFrame) {

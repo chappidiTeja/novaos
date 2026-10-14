@@ -2,9 +2,14 @@ use core::arch::asm;
 use core::mem::size_of;
 use core::ptr::{addr_of, addr_of_mut};
 
+// Layout is dictated by SYSCALL/SYSRET: STAR holds 0x08 for the kernel pair
+// (CS=0x08, SS=0x10) and 0x10 for the user pair (SS=0x10+8, CS=0x10+16), so
+// user data must sit directly before user code.
 pub const KERNEL_CS: u16 = 0x08;
 pub const KERNEL_DS: u16 = 0x10;
-const TSS_SEL: u16 = 0x18;
+pub const USER_DS: u16 = 0x18 | 3;
+pub const USER_CS: u16 = 0x20 | 3;
+const TSS_SEL: u16 = 0x28;
 
 /// IDT IST index (1-based) that points at the dedicated double-fault stack.
 pub const DOUBLE_FAULT_IST: u8 = 1;
@@ -39,7 +44,13 @@ static mut TSS: Tss = Tss {
     iomap_base: size_of::<Tss>() as u16,
 };
 static mut DOUBLE_FAULT_STACK: Stack = Stack([0; 16384]);
-static mut GDT: [u64; 5] = [0; 5];
+static mut GDT: [u64; 7] = [0; 7];
+
+/// Stack the CPU switches to when an interrupt or exception arrives from ring 3.
+/// Must be the top of the running thread's kernel stack.
+pub fn set_kernel_stack(rsp0: u64) {
+    unsafe { addr_of_mut!(TSS.rsp).write_unaligned([rsp0, 0, 0]) };
+}
 
 pub fn init() {
     unsafe {
@@ -61,12 +72,14 @@ pub fn init() {
             0,
             0x00AF_9A00_0000_FFFF, // kernel code, 64-bit
             0x00CF_9200_0000_FFFF, // kernel data
+            0x00CF_F200_0000_FFFF, // user data (DPL 3)
+            0x00AF_FA00_0000_FFFF, // user code, 64-bit (DPL 3)
             tss_low,
             tss_high,
         ]);
 
         let ptr = DescriptorPointer {
-            limit: (size_of::<[u64; 5]>() - 1) as u16,
+            limit: (size_of::<[u64; 7]>() - 1) as u16,
             base: addr_of!(GDT) as u64,
         };
         asm!("lgdt [{}]", in(reg) addr_of!(ptr), options(readonly, nostack, preserves_flags));

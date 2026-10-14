@@ -1,9 +1,16 @@
-//! Virtual memory: edits the live 4-level page tables (the ones Limine set up).
-//! Page tables are reached through the higher-half direct map.
+//! Virtual memory: edits 4-level page tables, both the live ones and those of
+//! other address spaces. Page tables are reached through the higher-half
+//! direct map.
+//!
+//! Address space layout: the lower half (PML4 slots 0-255) belongs to a process;
+//! the upper half (slots 256-511) is the kernel and is shared by all of them.
+//! Every upper-half slot is created at boot so that later kernel mappings only
+//! ever add entries to tables that all address spaces already share.
 
 use super::{phys_to_virt, pmm};
 use core::arch::asm;
 use core::ptr::{read_volatile, write_volatile};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 pub const PRESENT: u64 = 1 << 0;
 pub const WRITABLE: u64 = 1 << 1;
@@ -15,6 +22,9 @@ const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 const MSR_EFER: u32 = 0xC000_0080;
 const EFER_NXE: u64 = 1 << 11;
 
+/// First address that is not user memory (the end of the canonical lower half).
+pub const USER_SPACE_END: u64 = 0x0000_8000_0000_0000;
+
 #[derive(Debug)]
 pub enum MapError {
     OutOfMemory,
@@ -23,10 +33,22 @@ pub enum MapError {
     HugePage,
 }
 
-fn read_cr3() -> u64 {
+/// The PML4 Limine gave us; the master copy of the kernel half.
+static KERNEL_CR3: AtomicU64 = AtomicU64::new(0);
+
+pub fn read_cr3() -> u64 {
     let value: u64;
     unsafe { asm!("mov {}, cr3", out(reg) value, options(nomem, nostack, preserves_flags)) };
     value & ADDR_MASK
+}
+
+/// Switch to the address space whose PML4 is at `pml4`.
+pub fn activate(pml4: u64) {
+    unsafe { asm!("mov cr3, {}", in(reg) pml4, options(nostack, preserves_flags)) };
+}
+
+pub fn kernel_cr3() -> u64 {
+    KERNEL_CR3.load(Ordering::Relaxed)
 }
 
 fn invlpg(virt: u64) {
@@ -42,14 +64,31 @@ fn read_msr(msr: u32) -> u64 {
     ((hi as u64) << 32) | lo as u64
 }
 
-/// Flags for ordinary kernel data: writable, and non-executable if the CPU
-/// has NX enabled (setting bit 63 without EFER.NXE would fault).
-pub fn data_flags() -> u64 {
+/// The no-execute bit if the CPU has NX enabled, else 0 (setting bit 63
+/// without EFER.NXE would fault).
+pub fn nx_flag() -> u64 {
     if read_msr(MSR_EFER) & EFER_NXE != 0 {
-        WRITABLE | NO_EXECUTE
+        NO_EXECUTE
     } else {
-        WRITABLE
+        0
     }
+}
+
+/// Flags for ordinary kernel data: writable and non-executable.
+pub fn data_flags() -> u64 {
+    WRITABLE | nx_flag()
+}
+
+/// Flags for a user page with the given permissions.
+pub fn user_flags(writable: bool, executable: bool) -> u64 {
+    let mut flags = USER;
+    if writable {
+        flags |= WRITABLE;
+    }
+    if !executable {
+        flags |= nx_flag();
+    }
+    flags
 }
 
 fn indices(virt: u64) -> [usize; 4] {
@@ -65,23 +104,45 @@ unsafe fn entry(table_phys: u64, index: usize) -> *mut u64 {
     (phys_to_virt(table_phys) as *mut u64).add(index)
 }
 
-/// Map the 4 KiB page at `virt` to the frame at `phys`, creating any missing
-/// intermediate tables from the physical allocator.
-pub fn map(virt: u64, phys: u64, flags: u64) -> Result<(), MapError> {
+/// Record the boot page tables as the kernel's master copy and make sure every
+/// kernel-half PML4 slot exists, so address spaces created later share them all.
+pub fn init() {
+    let master = read_cr3();
+    KERNEL_CR3.store(master, Ordering::Relaxed);
+    for index in 256..512 {
+        let slot = unsafe { entry(master, index) };
+        if unsafe { read_volatile(slot) } & PRESENT == 0 {
+            let frame = pmm::alloc_zeroed_frame().expect("vmm: out of memory for kernel PML4");
+            unsafe { write_volatile(slot, frame | PRESENT | WRITABLE) };
+        }
+    }
+}
+
+/// Map the 4 KiB page at `virt` to the frame at `phys` in the address space whose
+/// PML4 is `pml4`, creating missing intermediate tables from the frame allocator.
+pub fn map_in(pml4: u64, virt: u64, phys: u64, flags: u64) -> Result<(), MapError> {
     assert!(virt % 4096 == 0 && phys % 4096 == 0, "vmm: unaligned map");
+    assert!(
+        flags & USER == 0 || virt < USER_SPACE_END,
+        "vmm: user page in kernel space"
+    );
     let idx = indices(virt);
-    let mut table = read_cr3();
+    let mut table = pml4;
 
     for level in 0..3 {
         let slot = unsafe { entry(table, idx[level]) };
         let value = unsafe { read_volatile(slot) };
         if value & PRESENT == 0 {
             let frame = pmm::alloc_zeroed_frame().ok_or(MapError::OutOfMemory)?;
-            unsafe { write_volatile(slot, frame | PRESENT | WRITABLE) };
+            unsafe { write_volatile(slot, frame | PRESENT | WRITABLE | (flags & USER)) };
             table = frame;
         } else if value & HUGE != 0 {
             return Err(MapError::HugePage);
         } else {
+            // Every level must allow user access for a user page to be reachable.
+            if flags & USER != 0 && value & USER == 0 {
+                unsafe { write_volatile(slot, value | USER) };
+            }
             table = value & ADDR_MASK;
         }
     }
@@ -93,6 +154,11 @@ pub fn map(virt: u64, phys: u64, flags: u64) -> Result<(), MapError> {
     unsafe { write_volatile(slot, phys | flags | PRESENT) };
     invlpg(virt);
     Ok(())
+}
+
+/// `map_in` for the live address space.
+pub fn map(virt: u64, phys: u64, flags: u64) -> Result<(), MapError> {
+    map_in(read_cr3(), virt, phys, flags)
 }
 
 /// Remove the mapping for the 4 KiB page at `virt`; returns the frame it pointed
@@ -119,27 +185,99 @@ pub fn unmap(virt: u64) -> Option<u64> {
     Some(value & ADDR_MASK)
 }
 
-/// Walk the page tables and return the physical address `virt` maps to,
-/// understanding 1 GiB and 2 MiB pages.
-pub fn translate(virt: u64) -> Option<u64> {
+pub struct Translation {
+    pub phys: u64,
+    /// Every level of the walk allows ring-3 access.
+    pub user: bool,
+    /// Every level of the walk allows writes.
+    pub writable: bool,
+}
+
+/// Walk the page tables of `pml4`, understanding 1 GiB and 2 MiB pages.
+pub fn translate_in(pml4: u64, virt: u64) -> Option<Translation> {
     let idx = indices(virt);
-    let mut table = read_cr3();
+    let mut table = pml4;
+    let mut user = true;
+    let mut writable = true;
 
     for level in 0..4 {
         let value = unsafe { read_volatile(entry(table, idx[level])) };
         if value & PRESENT == 0 {
             return None;
         }
-        if level == 1 && value & HUGE != 0 {
-            return Some((value & ADDR_MASK & !0x3FFF_FFFF) | (virt & 0x3FFF_FFFF));
-        }
-        if level == 2 && value & HUGE != 0 {
-            return Some((value & ADDR_MASK & !0x1F_FFFF) | (virt & 0x1F_FFFF));
-        }
-        if level == 3 {
-            return Some((value & ADDR_MASK) | (virt & 0xFFF));
+        user &= value & USER != 0;
+        writable &= value & WRITABLE != 0;
+
+        let phys = if level == 1 && value & HUGE != 0 {
+            Some((value & ADDR_MASK & !0x3FFF_FFFF) | (virt & 0x3FFF_FFFF))
+        } else if level == 2 && value & HUGE != 0 {
+            Some((value & ADDR_MASK & !0x1F_FFFF) | (virt & 0x1F_FFFF))
+        } else if level == 3 {
+            Some((value & ADDR_MASK) | (virt & 0xFFF))
+        } else {
+            None
+        };
+        if let Some(phys) = phys {
+            return Some(Translation { phys, user, writable });
         }
         table = value & ADDR_MASK;
     }
     None
+}
+
+/// Physical address `virt` maps to in the live address space.
+pub fn translate(virt: u64) -> Option<u64> {
+    translate_in(read_cr3(), virt).map(|t| t.phys)
+}
+
+/// Create an empty address space: no user mappings, kernel half shared with
+/// every other address space. Returns the PML4's physical address.
+pub fn new_address_space() -> Option<u64> {
+    let pml4 = pmm::alloc_zeroed_frame()?;
+    let master = kernel_cr3();
+    for index in 256..512 {
+        unsafe {
+            let value = read_volatile(entry(master, index));
+            write_volatile(entry(pml4, index), value);
+        }
+    }
+    Some(pml4)
+}
+
+/// Free everything a process owns: its mapped user pages, its page tables and
+/// the PML4. Kernel-half tables are shared and left alone. The address space
+/// must not be the live one.
+pub fn destroy_address_space(pml4: u64) {
+    assert!(pml4 != read_cr3(), "vmm: destroying the live address space");
+    for i4 in 0..256 {
+        let e4 = unsafe { read_volatile(entry(pml4, i4)) };
+        if e4 & PRESENT == 0 {
+            continue;
+        }
+        let pdpt = e4 & ADDR_MASK;
+        for i3 in 0..512 {
+            let e3 = unsafe { read_volatile(entry(pdpt, i3)) };
+            if e3 & PRESENT == 0 || e3 & HUGE != 0 {
+                continue;
+            }
+            let pd = e3 & ADDR_MASK;
+            for i2 in 0..512 {
+                let e2 = unsafe { read_volatile(entry(pd, i2)) };
+                if e2 & PRESENT == 0 || e2 & HUGE != 0 {
+                    continue;
+                }
+                let pt = e2 & ADDR_MASK;
+                for i1 in 0..512 {
+                    let e1 = unsafe { read_volatile(entry(pt, i1)) };
+                    if e1 & PRESENT != 0 {
+                        pmm::free_frame(e1 & ADDR_MASK);
+                    }
+                }
+                pmm::free_frame(pt);
+            }
+            pmm::free_frame(pd);
+        }
+        pmm::free_frame(pdpt);
+    }
+    pmm::free_frame(pml4);
 }

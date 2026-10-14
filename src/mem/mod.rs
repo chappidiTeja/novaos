@@ -71,6 +71,7 @@ pub fn init() {
         free * PAGE_SIZE / (1024 * 1024)
     );
 
+    vmm::init();
     heap::init();
     println!(
         "[ok] heap: {} KiB at {:#x}",

@@ -48,6 +48,17 @@ pub fn _print(args: fmt::Arguments) {
     let _ = Serial.write_fmt(args);
 }
 
+/// Write raw bytes (e.g. from a user process), keeping them together.
+pub fn write_bytes(bytes: &[u8]) {
+    let _guard = PRINT_LOCK.lock();
+    for &b in bytes {
+        if b == b'\n' {
+            write_byte(b'\r');
+        }
+        write_byte(b);
+    }
+}
+
 /// For crash paths: make sure the report can be printed even if the code that
 /// crashed was in the middle of printing.
 pub fn force_unlock() {

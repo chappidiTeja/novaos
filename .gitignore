@@ -1,4 +1,5 @@
 target/
+build/
 iso_root/
 *.iso
 serial.log
