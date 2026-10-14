@@ -1,0 +1,135 @@
+use core::arch::asm;
+use core::mem::size_of;
+use core::ptr::{addr_of, addr_of_mut};
+
+use crate::gdt::{DOUBLE_FAULT_IST, KERNEL_CS};
+use crate::{keyboard, pic, println, timer};
+
+pub const IRQ_TIMER: u8 = pic::IRQ_BASE;
+pub const IRQ_KEYBOARD: u8 = pic::IRQ_BASE + 1;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Entry {
+    offset_low: u16,
+    selector: u16,
+    ist: u8,
+    attr: u8,
+    offset_mid: u16,
+    offset_high: u32,
+    zero: u32,
+}
+
+impl Entry {
+    const MISSING: Entry = Entry {
+        offset_low: 0,
+        selector: 0,
+        ist: 0,
+        attr: 0,
+        offset_mid: 0,
+        offset_high: 0,
+        zero: 0,
+    };
+
+    fn new(handler: usize, ist: u8) -> Entry {
+        Entry {
+            offset_low: handler as u16,
+            selector: KERNEL_CS,
+            ist,
+            attr: 0x8E, // present, ring 0, interrupt gate
+            offset_mid: (handler >> 16) as u16,
+            offset_high: (handler >> 32) as u32,
+            zero: 0,
+        }
+    }
+}
+
+/// What the CPU pushes before entering a handler.
+#[repr(C)]
+pub struct InterruptStackFrame {
+    pub rip: u64,
+    pub cs: u64,
+    pub rflags: u64,
+    pub rsp: u64,
+    pub ss: u64,
+}
+
+#[repr(C, packed)]
+struct DescriptorPointer {
+    limit: u16,
+    base: u64,
+}
+
+static mut IDT: [Entry; 256] = [Entry::MISSING; 256];
+
+fn set(vector: u8, handler: usize, ist: u8) {
+    unsafe { (*addr_of_mut!(IDT))[vector as usize] = Entry::new(handler, ist) };
+}
+
+pub fn init() {
+    set(0, divide_error as *const () as usize, 0);
+    set(3, breakpoint as *const () as usize, 0);
+    set(6, invalid_opcode as *const () as usize, 0);
+    set(8, double_fault as *const () as usize, DOUBLE_FAULT_IST);
+    set(13, general_protection as *const () as usize, 0);
+    set(14, page_fault as *const () as usize, 0);
+    set(IRQ_TIMER, timer_irq as *const () as usize, 0);
+    set(IRQ_KEYBOARD, keyboard_irq as *const () as usize, 0);
+
+    let ptr = DescriptorPointer {
+        limit: (size_of::<[Entry; 256]>() - 1) as u16,
+        base: addr_of!(IDT) as u64,
+    };
+    unsafe {
+        asm!("lidt [{}]", in(reg) addr_of!(ptr), options(readonly, nostack, preserves_flags));
+    }
+}
+
+fn fatal(name: &str, frame: &InterruptStackFrame, error_code: Option<u64>) -> ! {
+    println!("\n*** EXCEPTION: {} ***", name);
+    if let Some(code) = error_code {
+        println!("error code: {:#x}", code);
+    }
+    println!(
+        "rip={:#x} cs={:#x} rflags={:#x} rsp={:#x} ss={:#x}",
+        frame.rip, frame.cs, frame.rflags, frame.rsp, frame.ss
+    );
+    crate::halt_forever()
+}
+
+extern "x86-interrupt" fn divide_error(frame: InterruptStackFrame) {
+    fatal("DIVIDE ERROR (#DE)", &frame, None)
+}
+
+extern "x86-interrupt" fn breakpoint(frame: InterruptStackFrame) {
+    println!("EXCEPTION: BREAKPOINT at {:#x} (recovered)", frame.rip);
+}
+
+extern "x86-interrupt" fn invalid_opcode(frame: InterruptStackFrame) {
+    fatal("INVALID OPCODE (#UD)", &frame, None)
+}
+
+extern "x86-interrupt" fn double_fault(frame: InterruptStackFrame, code: u64) -> ! {
+    fatal("DOUBLE FAULT (#DF)", &frame, Some(code))
+}
+
+extern "x86-interrupt" fn general_protection(frame: InterruptStackFrame, code: u64) {
+    fatal("GENERAL PROTECTION FAULT (#GP)", &frame, Some(code))
+}
+
+extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: u64) {
+    let cr2: u64;
+    unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags)) };
+    println!("faulting address (CR2): {:#x}", cr2);
+    fatal("PAGE FAULT (#PF)", &frame, Some(code))
+}
+
+extern "x86-interrupt" fn timer_irq(_frame: InterruptStackFrame) {
+    timer::tick();
+    pic::end_of_interrupt(IRQ_TIMER);
+}
+
+extern "x86-interrupt" fn keyboard_irq(_frame: InterruptStackFrame) {
+    keyboard::handle_interrupt();
+    pic::end_of_interrupt(IRQ_KEYBOARD);
+}

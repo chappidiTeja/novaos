@@ -1,0 +1,9 @@
+[build]
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+rustflags = [
+    "-Crelocation-model=static",
+    "-Clink-arg=-Tlinker.ld",
+    "-Clink-arg=-zmax-page-size=0x1000",
+]
