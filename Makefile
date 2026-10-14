@@ -1,6 +1,7 @@
 LIMINE   ?= $(HOME)/os/limine
 KERNEL   := target/x86_64-unknown-none/release/kernel
 ISO      := novaos.iso
+TEST_ISO := novaos-test.iso
 
 USER_OUT  := user/target/x86_64-unknown-none/release
 USER_ELF  := build/hello.elf
@@ -12,7 +13,7 @@ DISK      := build/disk.img
 # The OS disk: a virtio block device, legacy interface only.
 QEMU_DISK = -drive file=$(1),if=none,id=disk0,format=raw -device virtio-blk-pci,drive=disk0,disable-modern=on
 
-.PHONY: all user kernel iso mkfs rootfs disk run test test-shell test-persistence test-fs clean
+.PHONY: all user kernel iso mkfs rootfs disk run test test-shell test-persistence test-crash test-fs clean
 
 all: iso
 
@@ -30,18 +31,26 @@ kernel: user
 $(LIMINE)/limine:
 	$(MAKE) -C $(LIMINE)
 
-iso: kernel $(LIMINE)/limine
+# Build one bootable image: $(1) = image file, $(2) = Limine config to put on it.
+define build_iso
 	rm -rf iso_root
 	mkdir -p iso_root/boot/limine iso_root/EFI/BOOT
 	cp $(KERNEL) iso_root/boot/kernel
-	cp limine.conf $(LIMINE)/limine-bios.sys $(LIMINE)/limine-bios-cd.bin $(LIMINE)/limine-uefi-cd.bin iso_root/boot/limine/
+	cp $(2) iso_root/boot/limine/limine.conf
+	cp $(LIMINE)/limine-bios.sys $(LIMINE)/limine-bios-cd.bin $(LIMINE)/limine-uefi-cd.bin iso_root/boot/limine/
 	cp $(LIMINE)/BOOTX64.EFI $(LIMINE)/BOOTIA32.EFI iso_root/EFI/BOOT/
 	xorriso -as mkisofs -R -r -J -b boot/limine/limine-bios-cd.bin \
 		-no-emul-boot -boot-load-size 4 -boot-info-table -hfsplus \
 		-apm-block-size 2048 --efi-boot boot/limine/limine-uefi-cd.bin \
 		-efi-boot-part --efi-boot-image --protective-msdos-label \
-		iso_root -o $(ISO)
-	$(LIMINE)/limine bios-install $(ISO)
+		iso_root -o $(1)
+	$(LIMINE)/limine bios-install $(1)
+endef
+
+# novaos.iso boots straight into the shell; novaos-test.iso first runs every self-test.
+iso: kernel $(LIMINE)/limine
+	$(call build_iso,$(ISO),limine.conf)
+	$(call build_iso,$(TEST_ISO),limine-test.conf)
 
 # The disk builder runs on the build machine and shares the kernel's filesystem code.
 mkfs:
@@ -69,7 +78,7 @@ run: iso disk
 # Non-interactive: boot on a fresh copy of the disk, then check the serial log.
 test: iso disk
 	cp $(DISK) build/disk-test.img
-	-timeout 40 qemu-system-x86_64 -cdrom $(ISO) -m 512M $(call QEMU_DISK,build/disk-test.img) -serial file:serial.log -display none -no-reboot
+	-timeout 40 qemu-system-x86_64 -cdrom $(TEST_ISO) -m 512M $(call QEMU_DISK,build/disk-test.img) -serial file:serial.log -display none -no-reboot
 	@cat serial.log
 	@grep -q "BREAKPOINT" serial.log && grep -q "\[ok\] timer" serial.log \
 		&& grep -q "\[ok\] pmm self-test" serial.log && grep -q "\[ok\] vmm self-test" serial.log \
@@ -89,7 +98,12 @@ test-shell: iso disk
 
 # Boots twice from one disk image: the second boot must see the first one's writes.
 test-persistence: iso disk
-	bash scripts/persistence_test.sh $(ISO) $(DISK) $(MKFS)
+	bash scripts/persistence_test.sh $(TEST_ISO) $(DISK) $(MKFS)
+
+# Power-cut experiment: kills the machine at random moments and reports how often
+# the disk survives (informational; NovaFS has no journal yet).
+test-crash: iso disk
+	bash scripts/crash_test.sh $(TEST_ISO) $(DISK) $(MKFS) 30 1.2 "disk self-test"
 
 # The filesystem's own unit tests, on the build machine.
 test-fs:
@@ -100,4 +114,4 @@ clean:
 	cd user && cargo clean
 	cd tools/mkfs && cargo clean
 	cd fs && cargo clean
-	rm -rf iso_root build $(ISO) serial.log
+	rm -rf iso_root build $(ISO) $(TEST_ISO) serial.log

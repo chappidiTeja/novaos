@@ -44,10 +44,19 @@ fn wait_for_interrupt() {
     unsafe { asm!("hlt", options(nomem, nostack)) };
 }
 
+
 #[no_mangle]
 extern "C" fn _start() -> ! {
     serial::init();
     println!("Hello from NovaOS!");
+
+    // The "selftest" boot entry (see limine-test.conf) runs every subsystem's
+    // self-test and exercises hostile programs. The normal entry skips them, so
+    // it boots straight into the shell without touching the disk's contents.
+    let selftest = limine::cmdline_has("selftest");
+    if selftest {
+        println!("[test] running with self-tests enabled");
+    }
 
     gdt::init();
     println!("[ok] GDT + TSS loaded");
@@ -60,30 +69,41 @@ extern "C" fn _start() -> ! {
     println!("[ok] PIC remapped, PIT at {} Hz", TIMER_HZ);
 
     mem::init();
-    mem::self_test();
+    if selftest {
+        mem::self_test();
+    }
 
     unsafe { asm!("sti", options(nomem, nostack)) };
 
-    unsafe { asm!("int3", options(nomem, nostack)) };
-
-    while timer::ticks() < TIMER_HZ as u64 {
-        wait_for_interrupt();
+    if selftest {
+        unsafe { asm!("int3", options(nomem, nostack)) };
+        while timer::ticks() < TIMER_HZ as u64 {
+            wait_for_interrupt();
+        }
+        println!("[ok] timer: {} ticks (~1 second)", timer::ticks());
     }
-    println!("[ok] timer: {} ticks (~1 second)", timer::ticks());
 
     sched::init();
     println!("[ok] scheduler: main + idle threads");
-    sched::self_test();
-    ipc::selftest::self_test();
+    if selftest {
+        sched::self_test();
+        ipc::selftest::self_test();
+    }
 
     match vfs::init() {
-        Ok(()) => vfs::self_test(),
+        Ok(()) => {
+            if selftest {
+                vfs::self_test();
+            }
+        }
         Err(reason) => println!("[disk] not available: {}", reason),
     }
 
     syscall::init();
     println!("[ok] syscall interface enabled");
-    proc::self_test();
+    if selftest {
+        proc::self_test();
+    }
 
     // Hand the machine to the shell on the disk; without a disk, fall back to a
     // tiny demo that reads one line.

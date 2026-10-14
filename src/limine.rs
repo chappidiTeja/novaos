@@ -67,6 +67,34 @@ pub const MEMMAP_BOOTLOADER_RECLAIMABLE: u64 = 5;
 pub const MEMMAP_EXECUTABLE_AND_MODULES: u64 = 6;
 pub const MEMMAP_FRAMEBUFFER: u64 = 7;
 
+#[repr(C)]
+pub struct CmdlineResponse {
+    pub revision: u64,
+    /// NUL-terminated kernel command line from the boot menu entry.
+    pub cmdline: *const u8,
+}
+
+#[used]
+#[link_section = ".requests"]
+pub static CMDLINE_REQUEST: Request<CmdlineResponse> =
+    Request::new(0x4b161536e598651e, 0xb390ad4a2f1f303a);
+
+/// True if the boot entry's `cmdline:` contains `flag` as a whole word.
+pub fn cmdline_has(flag: &str) -> bool {
+    let Some(response) = CMDLINE_REQUEST.response() else { return false };
+    if response.cmdline.is_null() {
+        return false;
+    }
+    let mut len = 0;
+    while len < 1024 && unsafe { *response.cmdline.add(len) } != 0 {
+        len += 1;
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(response.cmdline, len) };
+    core::str::from_utf8(bytes)
+        .map(|line| line.split_whitespace().any(|word| word == flag))
+        .unwrap_or(false)
+}
+
 #[used]
 #[link_section = ".requests"]
 pub static HHDM_REQUEST: Request<HhdmResponse> =

@@ -16,6 +16,7 @@ trap 'exec 3>&- 2>/dev/null; kill $QEMU_PID $CAT_PID 2>/dev/null; rm -rf "$dir"'
 
 cp "$DISK" "$dir/disk.img"
 mkfifo "$dir/chan.in" "$dir/chan.out"
+boot_started=$(date +%s.%N)
 qemu-system-x86_64 -cdrom "$ISO" -m 512M -display none -no-reboot \
     -drive "file=$dir/disk.img,if=none,id=disk0,format=raw" \
     -device virtio-blk-pci,drive=disk0,disable-modern=on \
@@ -84,6 +85,9 @@ if ! wait_for_prompts 1 120; then
     tail -8 "$log"
     exit 1
 fi
+boot_seconds=$(awk -v a="$boot_started" -v b="$(date +%s.%N)" 'BEGIN { printf "%.1f", b - a }')
+echo "boot to shell prompt: ${boot_seconds} s (QEMU software emulation, no KVM)"
+grep -aq "self-tests enabled" "$log" && fail "the normal boot entry ran the self-tests"
 
 # What the large pipeline should count, computed independently of the OS.
 read -r PL PW PB < <(python3 -c "
