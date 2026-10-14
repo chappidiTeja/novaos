@@ -9,7 +9,7 @@ const PIC2_DATA: u16 = 0xA1;
 pub const IRQ_BASE: u8 = 0x20;
 
 /// Remap the legacy 8259 PICs away from the exception vectors and unmask
-/// only the timer (IRQ0) and keyboard (IRQ1).
+/// only the timer (IRQ0), keyboard (IRQ1) and first serial port (IRQ4).
 pub fn init() {
     unsafe {
         outb(PIC1_CMD, 0x11); // start initialization, expect ICW4
@@ -28,7 +28,7 @@ pub fn init() {
         io_wait();
         outb(PIC2_DATA, 0x01);
         io_wait();
-        outb(PIC1_DATA, 0xFC); // unmask IRQ0 + IRQ1
+        outb(PIC1_DATA, 0xEC); // unmask IRQ0, IRQ1, IRQ4 (a set bit masks the line)
         outb(PIC2_DATA, 0xFF);
     }
 }

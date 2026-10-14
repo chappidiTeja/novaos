@@ -1,5 +1,4 @@
 use crate::port::inb;
-use crate::print;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 // Scancode set 1, make codes 0x00..0x39. 0 means "no printable character".
@@ -20,7 +19,7 @@ pub fn handle_interrupt() {
             let table = if SHIFT.load(Ordering::Relaxed) { SHIFTED } else { NORMAL };
             if let Some(&c) = table.get(code as usize) {
                 if c != 0 {
-                    print!("{}", c as char);
+                    crate::ipc::console::push_input(c);
                 }
             }
         }

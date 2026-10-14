@@ -15,10 +15,14 @@ const SYS_GETPID: u64 = 2;
 const SYS_SLEEP: u64 = 3;
 const SYS_YIELD: u64 = 4;
 const SYS_TICKS: u64 = 5;
+const SYS_READ: u64 = 6;
+const SYS_PIPE: u64 = 7;
+const SYS_CLOSE: u64 = 8;
 
 const EBADF: i64 = -9;
 const EFAULT: i64 = -14;
 const EINVAL: i64 = -22;
+const EPIPE: i64 = -32;
 const ENOSYS: i64 = -38;
 
 /// Top of the user stack, as laid out by the kernel.
@@ -46,6 +50,14 @@ unsafe fn syscall(nr: u64, a1: u64, a2: u64, a3: u64) -> i64 {
 
 fn write(fd: u64, ptr: u64, len: u64) -> i64 {
     unsafe { syscall(SYS_WRITE, fd, ptr, len) }
+}
+
+fn read(fd: u64, ptr: u64, len: u64) -> i64 {
+    unsafe { syscall(SYS_READ, fd, ptr, len) }
+}
+
+fn close(fd: u64) -> i64 {
+    unsafe { syscall(SYS_CLOSE, fd, 0, 0) }
 }
 
 fn print(s: &str) {
@@ -101,8 +113,183 @@ pub extern "C" fn _start(mode: u64) -> ! {
         7 => read_kernel_memory(),
         8 => stack_overflow(),
         9 => write_to_code(),
+        10 => stdin_reader(),
+        11 => console_demo(),
+        12 => pipe_writer(),
+        13 => pipe_reader(),
+        14 => pipe_syscalls(),
+        15 => broken_pipe(),
         _ => exit(99),
     }
+}
+
+/// Reads exactly three bytes from stdin; the kernel sends "abc" once this
+/// process is blocked in read.
+fn stdin_reader() -> ! {
+    let mut got = [0u8; 3];
+    let mut n = 0;
+    while n < 3 {
+        let r = read(0, got[n..].as_mut_ptr() as u64, (3 - n) as u64);
+        if r <= 0 {
+            exit(2);
+        }
+        n += r as usize;
+    }
+    if &got == b"abc" {
+        print("stdin delivered abc\n");
+        exit(0)
+    }
+    print("stdin delivered the wrong bytes\n");
+    exit(1)
+}
+
+/// Interactive: echo what the user types, then repeat the whole line.
+fn console_demo() -> ! {
+    print("type a line and press Enter: ");
+    let mut line = [0u8; 128];
+    let mut n = 0;
+    loop {
+        let mut byte = [0u8; 1];
+        if read(0, byte.as_mut_ptr() as u64, 1) <= 0 {
+            exit(1);
+        }
+        if byte[0] == b'\n' || byte[0] == b'\r' {
+            break;
+        }
+        write(1, byte.as_ptr() as u64, 1); // echo
+        if n < line.len() {
+            line[n] = byte[0];
+            n += 1;
+        }
+    }
+    print("\nyou typed: ");
+    write(1, line.as_ptr() as u64, n as u64);
+    print("\n");
+    exit(0)
+}
+
+fn pattern(index: usize) -> u8 {
+    (index % 251) as u8
+}
+
+/// Total bytes sent through the pipe between process 12 and process 13.
+const PIPE_TOTAL: usize = 50_000;
+
+/// Writes through fd 3 and exits without closing it. Starts late and ends with
+/// a pause, so the reader is asleep both when the data starts and when this
+/// process exits: only the kernel closing the descriptor at exit can wake it.
+fn pipe_writer() -> ! {
+    sleep(5);
+    let mut chunk = [0u8; 1000];
+    let mut sent = 0;
+    while sent < PIPE_TOTAL {
+        for (i, byte) in chunk.iter_mut().enumerate() {
+            *byte = pattern(sent + i);
+        }
+        let r = write(3, chunk.as_ptr() as u64, chunk.len() as u64);
+        if r != chunk.len() as i64 {
+            exit(1);
+        }
+        sent += chunk.len();
+    }
+    sleep(5); // let the reader drain everything and go back to sleep
+    exit(0)
+}
+
+/// Reads fd 3 until end of file, checking every byte.
+fn pipe_reader() -> ! {
+    let mut buf = [0u8; 700];
+    let mut received = 0;
+    loop {
+        let r = read(3, buf.as_mut_ptr() as u64, buf.len() as u64);
+        if r < 0 {
+            exit(2);
+        }
+        if r == 0 {
+            break; // end of file: the writer has exited
+        }
+        for (i, &byte) in buf[..r as usize].iter().enumerate() {
+            if byte != pattern(received + i) {
+                print("pipe data corrupted\n");
+                exit(3);
+            }
+        }
+        received += r as usize;
+    }
+    if received == PIPE_TOTAL {
+        print("pipe delivered all bytes in order\n");
+        exit(0)
+    }
+    print("pipe lost bytes\n");
+    exit(1)
+}
+
+/// Descriptors and pipes used entirely inside one process.
+fn pipe_syscalls() -> ! {
+    let mut fds = [0u64; 2];
+    let made = unsafe { syscall(SYS_PIPE, fds.as_mut_ptr() as u64, 0, 0) };
+    let (rd, wr) = (fds[0], fds[1]);
+    let mut buf = [0u8; 8];
+
+    let wrote = write(wr, b"hello".as_ptr() as u64, 5);
+    let got = read(rd, buf.as_mut_ptr() as u64, 8);
+    let same = &buf[..5] == b"hello";
+    let closed_writer = close(wr);
+    let eof = read(rd, buf.as_mut_ptr() as u64, 8); // empty and no writer: EOF
+    let closed_reader = close(rd);
+    let closed_twice = close(rd);
+    let bad_fd = read(99, buf.as_mut_ptr() as u64, 1);
+    let write_to_read_end = write(rd, b"x".as_ptr() as u64, 1); // rd is closed now
+    let bad_ptr = unsafe { syscall(SYS_PIPE, 0x10, 0, 0) };
+
+    // The destination of a read must be writable: the code segment is not.
+    let mut second = [0u64; 2];
+    unsafe { syscall(SYS_PIPE, second.as_mut_ptr() as u64, 0, 0) };
+    write(second[1], b"y".as_ptr() as u64, 1);
+    let into_code = read(second[0], black_box(_start as *const () as usize) as u64, 1);
+    // The byte must still be there: a rejected read consumes nothing.
+    let still_there = read(second[0], buf.as_mut_ptr() as u64, 1);
+
+    let ok = made == 0
+        && wrote == 5
+        && got == 5
+        && same
+        && closed_writer == 0
+        && eof == 0
+        && closed_reader == 0
+        && closed_twice == EBADF
+        && bad_fd == EBADF
+        && write_to_read_end == EBADF
+        && bad_ptr == EFAULT
+        && into_code == EFAULT
+        && still_there == 1;
+    if ok {
+        print("pipe syscall checks passed\n");
+        exit(0)
+    }
+    print("pipe syscall checks FAILED: ");
+    for r in [
+        made, wrote, got, closed_writer, eof, closed_reader, closed_twice, bad_fd,
+        write_to_read_end, bad_ptr, into_code, still_there,
+    ] {
+        print_signed(r);
+        print(" ");
+    }
+    print("\n");
+    exit(1)
+}
+
+/// fd 3 is a pipe whose read end no longer exists anywhere.
+fn broken_pipe() -> ! {
+    let r = write(3, b"anyone?".as_ptr() as u64, 7);
+    if r == EPIPE {
+        print("broken pipe reported\n");
+        exit(0)
+    }
+    print("write to a dead pipe returned ");
+    print_signed(r);
+    print("\n");
+    exit(1)
 }
 
 fn hello() -> ! {

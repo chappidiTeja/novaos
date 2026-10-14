@@ -4,7 +4,7 @@ ISO      := novaos.iso
 
 USER_ELF := build/hello.elf
 
-.PHONY: all user kernel iso run test clean
+.PHONY: all user kernel iso run test test-input clean
 
 all: iso
 
@@ -41,15 +41,21 @@ run: iso
 
 # Non-interactive: boot for a few seconds, then check the serial log.
 test: iso
-	-timeout 10 qemu-system-x86_64 -cdrom $(ISO) -m 512M -serial file:serial.log -display none -no-reboot
+	-timeout 25 qemu-system-x86_64 -cdrom $(ISO) -m 512M -serial file:serial.log -display none -no-reboot
 	@cat serial.log
 	@grep -q "BREAKPOINT" serial.log && grep -q "\[ok\] timer" serial.log \
 		&& grep -q "\[ok\] pmm self-test" serial.log && grep -q "\[ok\] vmm self-test" serial.log \
 		&& grep -q "\[ok\] heap self-test" serial.log \
 		&& grep -q "\[ok\] scheduler self-test" serial.log \
+		&& grep -q "\[ok\] ipc self-test" serial.log \
+		&& grep -q "type a line and press Enter" serial.log \
 		&& grep -q "hello from user mode" serial.log \
 		&& grep -q "\[ok\] user-mode self-test" serial.log \
 		&& ! grep -q "KERNEL PANIC" serial.log && echo "TEST PASSED" || (echo "TEST FAILED"; exit 1)
+
+# Types a line into the OS over its serial port and checks the reply.
+test-input: iso
+	bash scripts/serial_input_test.sh $(ISO)
 
 clean:
 	cargo clean

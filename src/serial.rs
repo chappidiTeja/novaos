@@ -9,13 +9,25 @@ pub struct Serial;
 
 pub fn init() {
     unsafe {
-        outb(COM1 + 1, 0x00); // disable UART interrupts
+        outb(COM1 + 1, 0x00); // disable UART interrupts while configuring
         outb(COM1 + 3, 0x80); // enable DLAB to set baud divisor
         outb(COM1, 0x01); // divisor 1 -> 115200 baud
         outb(COM1 + 1, 0x00);
         outb(COM1 + 3, 0x03); // 8 data bits, no parity, 1 stop bit
         outb(COM1 + 2, 0xC7); // enable and clear FIFOs
-        outb(COM1 + 4, 0x0B); // RTS/DSR set, OUT2 set
+        outb(COM1 + 4, 0x0B); // RTS/DSR set, OUT2 set (routes the IRQ)
+        outb(COM1 + 1, 0x01); // interrupt when a received byte is available
+    }
+}
+
+/// The next received byte, if one is waiting.
+pub fn try_read() -> Option<u8> {
+    unsafe {
+        if inb(COM1 + 5) & 0x01 != 0 {
+            Some(inb(COM1))
+        } else {
+            None
+        }
     }
 }
 

@@ -7,6 +7,7 @@ extern crate alloc;
 mod elf;
 mod gdt;
 mod idt;
+mod ipc;
 mod keyboard;
 mod limine;
 mod mem;
@@ -35,6 +36,7 @@ pub fn halt_forever() -> ! {
     }
 }
 
+/// Used before the scheduler exists.
 fn wait_for_interrupt() {
     unsafe { asm!("hlt", options(nomem, nostack)) };
 }
@@ -69,14 +71,18 @@ extern "C" fn _start() -> ! {
     sched::init();
     println!("[ok] scheduler: main + idle threads");
     sched::self_test();
+    ipc::selftest::self_test();
 
     syscall::init();
     println!("[ok] syscall interface enabled");
     proc::self_test();
 
-    println!("Type on the keyboard:");
+    // Interactive demo: reads a line from the keyboard or serial port.
+    proc::spawn_console_demo();
+
+    // Nothing left for the boot thread to do; let the idle thread have the CPU.
     loop {
-        wait_for_interrupt();
+        sched::sleep_ticks(1000);
     }
 }
 

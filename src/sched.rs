@@ -25,7 +25,11 @@ const RESERVED_THREADS: usize = 64;
 enum State {
     Ready,
     Running,
+    /// Waiting for a timer deadline (`sleep_ticks`).
     Sleeping,
+    /// Waiting for `wake` from another thread or an interrupt, optionally with
+    /// a deadline (see `block_current`).
+    Blocked,
     Dead,
 }
 
@@ -142,8 +146,12 @@ impl Sched {
         id
     }
 
-    /// Choose the next thread, or None if the current thread keeps running.
-    fn pick_next(&mut self) -> Option<Switch> {
+    /// Take exited threads (other than the one still running on its own stack)
+    /// out of the table. The caller drops them after leaving the scheduler's
+    /// critical section: dropping a process closes its pipes, which wakes
+    /// waiters, which needs the scheduler again.
+    fn reap(&mut self) -> Vec<Box<Thread>> {
+        let mut dead = Vec::new();
         let mut i = 0;
         while i < self.zombies.len() {
             let id = self.zombies[i];
@@ -151,11 +159,32 @@ impl Sched {
                 i += 1;
             } else {
                 self.zombies.swap_remove(i);
-                self.threads[id] = None;
+                if let Some(thread) = self.threads[id].take() {
+                    dead.push(thread);
+                }
                 self.free_slots.push(id);
             }
         }
+        dead
+    }
 
+    /// Make a Blocked thread ready again. Returns false if it was not blocked
+    /// (already woken, timed out, or gone), so callers can skip stale entries.
+    fn wake(&mut self, id: usize) -> bool {
+        match self.threads.get_mut(id) {
+            Some(Some(thread)) if thread.state == State::Blocked => {
+                thread.state = State::Ready;
+                // A timed wait registered a deadline too; it no longer applies.
+                self.sleeping.retain(|&s| s != id);
+                self.ready.push_back(id);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Choose the next thread, or None if the current thread keeps running.
+    fn pick_next(&mut self) -> Option<Switch> {
         let old = self.current;
         if self.thread(old).state == State::Running {
             self.thread(old).state = State::Ready;
@@ -186,7 +215,11 @@ impl Sched {
 
 /// Switch to the next thread. Must be called with interrupts disabled.
 fn schedule() {
-    let switch = SCHED.with(|s| s.pick_next());
+    let (dead, switch) = SCHED.with(|s| {
+        let dead = s.reap();
+        (dead, s.pick_next())
+    });
+    drop(dead);
     if let Some(sw) = switch {
         // The kernel half is identical in every address space, so it is safe to
         // change page tables while still running on the outgoing thread's stack.
@@ -343,6 +376,33 @@ pub fn sleep_ticks(ticks: u64) {
     });
     schedule();
     irq_restore(flags);
+}
+
+/// Park the calling thread until another thread or an interrupt handler calls
+/// `wake` for it, or until the timer reaches `deadline` (if given).
+///
+/// Interrupts must already be disabled by the caller, and the caller must have
+/// put its id where the waker will find it *before* calling this; that keeps
+/// "check condition, register, sleep" atomic on one CPU, so no wake-up is lost.
+/// Returning does not mean the condition holds: re-check it.
+pub fn block_current(deadline: Option<u64>) {
+    SCHED.with(|s| {
+        let id = s.current;
+        assert!(id != s.idle, "the idle thread cannot block");
+        let thread = s.thread(id);
+        thread.state = State::Blocked;
+        if let Some(deadline) = deadline {
+            thread.wake_at = deadline;
+            s.sleeping.push(id);
+        }
+    });
+    schedule();
+}
+
+/// Wake a thread parked in `block_current`. Safe to call from interrupt
+/// handlers. Returns false if the thread was not blocked.
+pub fn wake(id: usize) -> bool {
+    SCHED.with(|s| s.wake(id))
 }
 
 pub fn sleep_ms(ms: u64) {

@@ -1,10 +1,16 @@
-//! User processes: an address space, a ring-3 entry point, and a handle the
-//! kernel can wait on. Each process runs on its own kernel thread, which
-//! provides the kernel stack for its system calls and interrupts.
+//! User processes: an address space, a ring-3 entry point, a file descriptor
+//! table, and a handle the kernel can wait on. Each process runs on its own
+//! kernel thread, which provides the kernel stack for its system calls and
+//! interrupts.
 
 use crate::gdt::{USER_CS, USER_DS};
+use crate::ipc::console;
+use crate::ipc::fd::{FdTable, File};
+use crate::ipc::pipe;
+use crate::ipc::waitq::WaitQueue;
 use crate::mem::{pmm, vmm, PAGE_SIZE};
-use crate::{elf, println, sched};
+use crate::sync::SpinLock;
+use crate::{elf, println, sched, timer};
 use alloc::sync::Arc;
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -17,6 +23,9 @@ const USER_STACK_PAGES: u64 = 16;
 const KILLED_BASE: i64 = 1000;
 
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
+
+/// The bundled test/demo program (see user/hello).
+pub const HELLO: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/build/hello.elf"));
 
 /// Owns a process's page tables and user pages; frees them all when dropped.
 pub struct AddressSpace {
@@ -34,12 +43,14 @@ pub struct ProcHandle {
     pub pid: u64,
     done: AtomicBool,
     code: AtomicI64,
+    finished: WaitQueue,
 }
 
 impl ProcHandle {
     pub fn finish(&self, code: i64) {
         self.code.store(code, Ordering::Relaxed);
         self.done.store(true, Ordering::Release);
+        self.finished.wake_all();
     }
 
     pub fn exit_code(&self) -> Option<i64> {
@@ -58,6 +69,8 @@ pub struct UserProc {
     pub rsp: u64,
     pub arg: u64,
     pub handle: Arc<ProcHandle>,
+    /// Shared so system calls can use it without holding the scheduler's data.
+    pub fds: Arc<SpinLock<FdTable>>,
 }
 
 #[derive(Debug)]
@@ -72,11 +85,23 @@ impl From<elf::ElfError> for SpawnError {
     }
 }
 
-/// Create a process from an ELF image and start it. `arg` arrives in rdi.
+/// Create a process from an ELF image with stdin/stdout/stderr on the console,
+/// and start it. `arg` arrives in rdi.
 pub fn spawn_user(
     name: &'static str,
     image: &[u8],
     arg: u64,
+) -> Result<Arc<ProcHandle>, SpawnError> {
+    spawn_user_with(name, image, arg, FdTable::with_stdio())
+}
+
+/// Like `spawn_user`, with a caller-prepared descriptor table (to hand the
+/// process pipe ends, for example).
+pub fn spawn_user_with(
+    name: &'static str,
+    image: &[u8],
+    arg: u64,
+    fds: FdTable,
 ) -> Result<Arc<ProcHandle>, SpawnError> {
     let pml4 = vmm::new_address_space().ok_or(SpawnError::OutOfMemory)?;
     // From here on, dropping `space` releases everything mapped so far.
@@ -97,6 +122,7 @@ pub fn spawn_user(
         pid: NEXT_PID.fetch_add(1, Ordering::Relaxed),
         done: AtomicBool::new(false),
         code: AtomicI64::new(0),
+        finished: WaitQueue::new(),
     });
     sched::spawn_user(
         name,
@@ -107,19 +133,18 @@ pub fn spawn_user(
             rsp: USER_STACK_TOP - 8,
             arg,
             handle: handle.clone(),
+            fds: Arc::new(SpinLock::new(fds)),
         },
     );
     Ok(handle)
 }
 
-/// Block until the process finishes, or `timeout_ticks` pass.
+/// Sleep until the process finishes, or `timeout_ticks` pass.
 pub fn wait(handle: &ProcHandle, timeout_ticks: u64) -> Option<i64> {
-    for _ in 0..timeout_ticks {
-        if let Some(code) = handle.exit_code() {
-            return Some(code);
-        }
-        sched::sleep_ticks(1);
-    }
+    let deadline = timer::ticks() + timeout_ticks;
+    handle
+        .finished
+        .wait_until_deadline(deadline, || handle.done.load(Ordering::Acquire));
     handle.exit_code()
 }
 
@@ -127,28 +152,38 @@ pub fn current_pid() -> u64 {
     sched::current_user_handle().map_or(0, |h| h.pid)
 }
 
-/// The exit system call.
-pub fn exit_current(code: i64) -> ! {
+/// The calling process's descriptor table.
+pub fn current_fds() -> Option<Arc<SpinLock<FdTable>>> {
+    sched::with_current_user(|u| u.fds.clone())
+}
+
+/// Close every descriptor (so pipe peers see EOF) and publish the exit status.
+fn finish_current(code: i64) {
+    if let Some(fds) = current_fds() {
+        fds.lock().close_all();
+    }
     if let Some(handle) = sched::current_user_handle() {
         handle.finish(code);
     }
+}
+
+/// The exit system call.
+pub fn exit_current(code: i64) -> ! {
+    finish_current(code);
     sched::exit()
 }
 
 /// Called from exception handlers when ring-3 code faulted: report it and
 /// terminate only that process. The kernel carries on.
 pub fn kill_current(what: &str, vector: u8, rip: u64) -> ! {
-    let pid = current_pid();
     println!(
         "[proc {} \"{}\"] killed: {} at rip={:#x}",
-        pid,
+        current_pid(),
         sched::current_name(),
         what,
         rip
     );
-    if let Some(handle) = sched::current_user_handle() {
-        handle.finish(-(KILLED_BASE + vector as i64));
-    }
+    finish_current(-(KILLED_BASE + vector as i64));
     sched::exit()
 }
 
@@ -193,11 +228,15 @@ global_asm!(
     user_cs = const USER_CS as u64,
 );
 
+/// Start the interactive demo: a user program that reads a line from stdin
+/// (keyboard or serial) and echoes it back. Runs detached.
+pub fn spawn_console_demo() {
+    let _ = spawn_user("console-demo", HELLO, 11).expect("could not start the console demo");
+}
+
 /// Runs the bundled user program in several modes, including hostile ones,
 /// and checks that the kernel contains each of them. Panics on failure.
 pub fn self_test() {
-    const HELLO: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/build/hello.elf"));
-
     // Exit status of a process killed by exception `vector`.
     const fn killed(vector: i64) -> i64 {
         -(KILLED_BASE + vector)
@@ -234,6 +273,45 @@ pub fn self_test() {
     println!("[ok] user: address spaces are isolated");
 
     run("syscall-flood", 6, 0);
+
+    // Stdin: the process blocks in read(0); typed bytes must wake it.
+    let reader = spawn_user("stdin-reader", HELLO, 10).expect("spawn stdin reader");
+    sched::sleep_ticks(5);
+    assert!(reader.exit_code().is_none(), "stdin reader did not block");
+    for &byte in b"abc" {
+        console::push_input(byte);
+    }
+    assert_eq!(wait(&reader, 500), Some(0), "stdin reader got the wrong bytes");
+    drop(reader);
+    println!("[ok] user: blocked in read(0), woken by input");
+
+    // Descriptors and pipes from inside a process.
+    run("pipe-syscalls", 14, 0);
+
+    // Two processes talk through a pipe the kernel created for them. The writer
+    // never closes it explicitly: exiting must close its end and give the
+    // reader end-of-file.
+    let (read_end, write_end) = pipe::pipe();
+    let mut reader_fds = FdTable::with_stdio();
+    reader_fds.install_at(3, File::PipeRead(read_end));
+    let mut writer_fds = FdTable::with_stdio();
+    writer_fds.install_at(3, File::PipeWrite(write_end));
+    let consumer = spawn_user_with("pipe-reader", HELLO, 13, reader_fds).expect("spawn reader");
+    let producer = spawn_user_with("pipe-writer", HELLO, 12, writer_fds).expect("spawn writer");
+    assert_eq!(wait(&producer, 1000), Some(0), "pipe writer failed");
+    assert_eq!(wait(&consumer, 1000), Some(0), "pipe reader saw wrong data");
+    drop((producer, consumer));
+    println!("[ok] user: 50000 bytes through a pipe between two processes");
+
+    // Writing to a pipe nobody can read must fail, not hang.
+    let (read_end, write_end) = pipe::pipe();
+    drop(read_end);
+    let mut fds = FdTable::with_stdio();
+    fds.install_at(3, File::PipeWrite(write_end));
+    let orphan = spawn_user_with("broken-pipe", HELLO, 15, fds).expect("spawn orphan writer");
+    assert_eq!(wait(&orphan, 500), Some(0), "broken pipe was not reported");
+    drop(orphan);
+    println!("[ok] user: write to an unread pipe returns an error");
 
     // Everything the processes owned must come back.
     sched::sleep_ticks(10);
