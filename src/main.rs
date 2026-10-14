@@ -2,12 +2,17 @@
 #![no_main]
 #![feature(abi_x86_interrupt)]
 
+extern crate alloc;
+
 mod gdt;
 mod idt;
 mod keyboard;
+mod limine;
+mod mem;
 mod pic;
 mod port;
 mod serial;
+mod sync;
 mod timer;
 
 use core::arch::asm;
@@ -44,6 +49,9 @@ extern "C" fn _start() -> ! {
     pic::init();
     timer::init(TIMER_HZ);
     println!("[ok] PIC remapped, PIT at {} Hz", TIMER_HZ);
+
+    mem::init();
+    mem::self_test();
 
     unsafe { asm!("sti", options(nomem, nostack)) };
 
