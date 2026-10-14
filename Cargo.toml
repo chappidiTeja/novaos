@@ -6,6 +6,8 @@ edition = "2021"
 [dependencies]
 # The filesystem is its own no_std crate so it can also be tested on the host.
 novafs = { path = "fs" }
+# 8x8 bitmap font (MIT licence) for the on-screen text console.
+font8x8 = { version = "0.3.1", default-features = false }
 
 [profile.dev]
 panic = "abort"

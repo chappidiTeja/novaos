@@ -95,6 +95,54 @@ pub fn cmdline_has(flag: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// One framebuffer as described by Limine (response revision 0 fields only).
+#[repr(C)]
+pub struct LimineFramebuffer {
+    /// Virtual address of the first pixel (in Limine's direct map).
+    pub address: *mut u8,
+    pub width: u64,
+    pub height: u64,
+    /// Bytes from the start of one row to the start of the next.
+    pub pitch: u64,
+    pub bpp: u16,
+    pub memory_model: u8,
+    pub red_mask_size: u8,
+    pub red_mask_shift: u8,
+    pub green_mask_size: u8,
+    pub green_mask_shift: u8,
+    pub blue_mask_size: u8,
+    pub blue_mask_shift: u8,
+}
+
+/// `memory_model` value for direct-colour RGB.
+pub const FRAMEBUFFER_RGB: u8 = 1;
+
+#[repr(C)]
+pub struct FramebufferResponse {
+    pub revision: u64,
+    pub framebuffer_count: u64,
+    pub framebuffers: *const *const LimineFramebuffer,
+}
+
+#[used]
+#[link_section = ".requests"]
+pub static FRAMEBUFFER_REQUEST: Request<FramebufferResponse> =
+    Request::new(0x9d5827dcd881dd75, 0xa3148604f6fab11b);
+
+/// The first framebuffer, if the bootloader set one up.
+pub fn first_framebuffer() -> Option<&'static LimineFramebuffer> {
+    let response = FRAMEBUFFER_REQUEST.response()?;
+    if response.framebuffer_count == 0 || response.framebuffers.is_null() {
+        return None;
+    }
+    let first = unsafe { *response.framebuffers };
+    if first.is_null() {
+        None
+    } else {
+        Some(unsafe { &*first })
+    }
+}
+
 #[used]
 #[link_section = ".requests"]
 pub static HHDM_REQUEST: Request<HhdmResponse> =

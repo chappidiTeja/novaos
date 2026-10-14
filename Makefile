@@ -13,7 +13,7 @@ DISK      := build/disk.img
 # The OS disk: a virtio block device, legacy interface only.
 QEMU_DISK = -drive file=$(1),if=none,id=disk0,format=raw -device virtio-blk-pci,drive=disk0,disable-modern=on
 
-.PHONY: all user kernel iso mkfs rootfs disk run test test-shell test-persistence test-crash test-fs clean
+.PHONY: all user kernel iso mkfs rootfs disk run test test-shell test-screen test-screen-selftest test-persistence test-crash test-fs clean
 
 all: iso
 
@@ -97,6 +97,14 @@ test-shell: iso disk
 	bash scripts/shell_test.sh $(ISO) $(DISK) $(MKFS)
 
 # Boots twice from one disk image: the second boot must see the first one's writes.
+# Takes real screenshots of the running OS and checks every pixel (see scripts/screen_test.py).
+# The second form boots the self-test image, whose long output scrolls the screen many times.
+test-screen: iso disk
+	python3 scripts/screen_test.py $(ISO) $(DISK) build/screens
+
+test-screen-selftest: iso disk
+	python3 scripts/screen_test.py $(TEST_ISO) $(DISK) build/screens-selftest
+
 test-persistence: iso disk
 	bash scripts/persistence_test.sh $(TEST_ISO) $(DISK) $(MKFS)
 

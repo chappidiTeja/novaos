@@ -6,6 +6,7 @@ extern crate alloc;
 
 mod elf;
 mod gdt;
+mod gfx;
 mod idt;
 mod ipc;
 mod keyboard;
@@ -48,7 +49,13 @@ fn wait_for_interrupt() {
 #[no_mangle]
 extern "C" fn _start() -> ! {
     serial::init();
+    // Bring the screen up first, so everything below shows on it as well as on serial.
+    let screen = gfx::console::init();
     println!("Hello from NovaOS!");
+    match screen {
+        Some((w, h, cols, rows)) => println!("[ok] screen: {}x{} pixels, {}x{} text", w, h, cols, rows),
+        None => println!("[gfx] no usable framebuffer; text goes to the serial port only"),
+    }
 
     // The "selftest" boot entry (see limine-test.conf) runs every subsystem's
     // self-test and exercises hostile programs. The normal entry skips them, so
@@ -103,6 +110,10 @@ extern "C" fn _start() -> ! {
     println!("[ok] syscall interface enabled");
     if selftest {
         proc::self_test();
+        // Repaint everything from the character grid; the screen test then checks
+        // that the grid and the picture agree after all the scrolling above.
+        gfx::console::redraw_all();
+        println!("[ok] screen redrawn from the character grid");
     }
 
     // Hand the machine to the shell on the disk; without a disk, fall back to a

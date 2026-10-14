@@ -41,6 +41,7 @@ fn write_byte(b: u8) {
 impl Write for Serial {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         for b in s.bytes() {
+            crate::gfx::console::put_byte(b); // the screen shows what the serial port shows
             if b == b'\n' {
                 write_byte(b'\r');
             }
@@ -64,6 +65,7 @@ pub fn _print(args: fmt::Arguments) {
 pub fn write_bytes(bytes: &[u8]) {
     let _guard = PRINT_LOCK.lock();
     for &b in bytes {
+        crate::gfx::console::put_byte(b);
         if b == b'\n' {
             write_byte(b'\r');
         }
@@ -75,6 +77,7 @@ pub fn write_bytes(bytes: &[u8]) {
 /// crashed was in the middle of printing.
 pub fn force_unlock() {
     unsafe { PRINT_LOCK.force_unlock() };
+    crate::gfx::console::force_unlock();
 }
 
 #[macro_export]
