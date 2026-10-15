@@ -1,4 +1,4 @@
-use crate::port::{io_wait, outb};
+use crate::port::{inb, io_wait, outb};
 
 const PIC1_CMD: u16 = 0x20;
 const PIC1_DATA: u16 = 0x21;
@@ -42,5 +42,42 @@ pub fn end_of_interrupt(vector: u8) {
             outb(PIC2_CMD, 0x20);
         }
         outb(PIC1_CMD, 0x20);
+    }
+}
+
+/// Let interrupt line `irq` (0-15) through the PIC. (Line 2, the cascade, is already open.)
+pub fn unmask(irq: u8) {
+    unsafe {
+        if irq < 8 {
+            outb(PIC1_DATA, inb(PIC1_DATA) & !(1 << irq));
+        } else {
+            outb(PIC2_DATA, inb(PIC2_DATA) & !(1 << (irq - 8)));
+        }
+    }
+}
+
+/// Was IRQ 7 (master) or 15 (slave) really requested? A PIC delivers these two vectors when a
+/// line goes quiet between raising its request and the CPU's acknowledgement; there is no
+/// device behind it. The in-service register tells the difference (OCW3, command 0x0B).
+pub fn is_real_irq(irq: u8) -> bool {
+    unsafe {
+        let (cmd, bit) = if irq == 15 { (PIC2_CMD, 1 << 7) } else { (PIC1_CMD, 1 << 7) };
+        outb(cmd, 0x0B);
+        inb(cmd) & bit != 0
+    }
+}
+
+/// Finish handling IRQ 7 or 15, real or not.
+pub fn end_of_spurious(irq: u8, real: bool) {
+    unsafe {
+        if irq == 15 {
+            if real {
+                outb(PIC2_CMD, 0x20);
+            }
+            // Either way the master saw the cascade line (IRQ 2) and needs its acknowledgement.
+            outb(PIC1_CMD, 0x20);
+        } else if real {
+            outb(PIC1_CMD, 0x20);
+        }
     }
 }

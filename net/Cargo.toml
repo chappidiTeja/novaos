@@ -1,0 +1,12 @@
+[package]
+name = "novanet"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone crate: the network stack. Used by the kernel (no_std) and tested on the host.
+[workspace]
+
+[dependencies]
+
+[profile.release]
+panic = "abort"

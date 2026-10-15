@@ -1,11 +1,12 @@
 //! Per-process file descriptor table.
 
 use super::pipe::{PipeReader, PipeWriter};
+use crate::net::{TcpSocket, UdpSocket};
 use crate::vfs::DiskFile;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-pub const MAX_FDS: usize = 16;
+pub const MAX_FDS: usize = 64;
 
 /// What a file descriptor can refer to.
 pub enum File {
@@ -15,6 +16,10 @@ pub enum File {
     PipeWrite(PipeWriter),
     /// A file or directory on the disk.
     Disk(DiskFile),
+    /// A UDP socket. Dropping the last reference frees its port.
+    Udp(UdpSocket),
+    /// A TCP socket (a listener or one end of a connection). Closing it ends the connection.
+    Tcp(TcpSocket),
 }
 
 pub struct FdTable {

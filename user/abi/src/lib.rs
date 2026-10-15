@@ -75,6 +75,80 @@ impl WinInfo {
     }
 }
 
+
+// ---- networking ----------------------------------------------------------------------
+
+/// An IPv4 address and port, as passed to the socket calls (8 bytes).
+#[repr(C)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct SockAddr {
+    pub ip: [u8; 4],
+    /// Host byte order (the kernel stores it little endian, like every other integer here).
+    pub port: u16,
+    pub pad: u16,
+}
+
+impl SockAddr {
+    pub const fn new(ip: [u8; 4], port: u16) -> SockAddr {
+        SockAddr { ip, port, pad: 0 }
+    }
+}
+
+pub const NET_LINK_UP: u32 = 1;
+pub const NET_HAS_ADDRESS: u32 = 2;
+pub const NET_DHCP_BOUND: u32 = 4;
+
+/// What `netinfo` returns (64 bytes).
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct NetInfo {
+    pub flags: u32,
+    pub mac: [u8; 6],
+    pub pad0: u16,
+    pub ip: [u8; 4],
+    pub mask: [u8; 4],
+    pub gateway: [u8; 4],
+    pub dns: [u8; 4],
+    pub pad1: u32,
+    pub rx_frames: u64,
+    pub tx_frames: u64,
+    pub rx_dropped: u64,
+    pub tx_dropped: u64,
+}
+
+/// "a.b.c.d" -> address. Strict: four decimal numbers 0-255 and nothing else.
+pub fn parse_ip(s: &str) -> Option<[u8; 4]> {
+    let mut out = [0u8; 4];
+    let mut parts = s.split('.');
+    for slot in out.iter_mut() {
+        let p = parts.next()?;
+        if p.is_empty() || p.len() > 3 || !p.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let mut v: u32 = 0;
+        for b in p.bytes() {
+            v = v * 10 + (b - b'0') as u32;
+        }
+        if v > 255 {
+            return None;
+        }
+        *slot = v as u8;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(out)
+}
+
+/// Prints as a dotted address.
+pub struct Ip4(pub [u8; 4]);
+
+impl core::fmt::Display for Ip4 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}.{}.{}.{}", self.0[0], self.0[1], self.0[2], self.0[3])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,5 +176,63 @@ mod tests {
         let info: WinInfo = unsafe { core::ptr::read_unaligned(raw.as_ptr() as *const WinInfo) };
         assert_eq!((info.id, info.width, info.height, info.title_len, info.owner, info.serial), (7, 640, 480, 3, 99, 5));
         assert_eq!(info.title(), b"abc");
+    }
+}
+
+#[cfg(test)]
+mod net_tests {
+    use super::*;
+    use core::mem::{offset_of, size_of};
+
+    #[test]
+    fn network_layouts_match_the_kernel() {
+        assert_eq!(size_of::<SockAddr>(), 8);
+        assert_eq!(size_of::<NetInfo>(), 64);
+        assert_eq!(offset_of!(NetInfo, mac), 4);
+        assert_eq!(offset_of!(NetInfo, ip), 12);
+        assert_eq!(offset_of!(NetInfo, mask), 16);
+        assert_eq!(offset_of!(NetInfo, gateway), 20);
+        assert_eq!(offset_of!(NetInfo, dns), 24);
+        assert_eq!(offset_of!(NetInfo, rx_frames), 32);
+        assert_eq!(offset_of!(NetInfo, tx_dropped), 56);
+        assert_eq!(offset_of!(SockAddr, port), 4);
+    }
+
+    #[test]
+    fn parse_ip_is_strict() {
+        assert_eq!(parse_ip("10.0.2.15"), Some([10, 0, 2, 15]));
+        assert_eq!(parse_ip("0.0.0.0"), Some([0; 4]));
+        assert_eq!(parse_ip("255.255.255.255"), Some([255; 4]));
+        for bad in ["", "1.2.3", "1.2.3.4.5", "256.1.1.1", "1..2.3", "1.2.3.", ".1.2.3", "a.b.c.d", "1.2.3.0x4", "+1.2.3.4", "1.2.3.4 ", " 1.2.3.4", "1.2.3.-4", "0001.2.3.4", "999.1.1.1"] {
+            assert_eq!(parse_ip(bad), None, "{bad:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn ip_prints_dotted() {
+        use core::fmt::Write;
+        let mut s = heapless_string::S::default();
+        write!(s, "{}", Ip4([192, 168, 1, 7])).unwrap();
+        assert_eq!(s.as_str(), "192.168.1.7");
+    }
+
+    mod heapless_string {
+        #[derive(Default)]
+        pub struct S {
+            buf: [u8; 32],
+            len: usize,
+        }
+        impl S {
+            pub fn as_str(&self) -> &str {
+                core::str::from_utf8(&self.buf[..self.len]).unwrap()
+            }
+        }
+        impl core::fmt::Write for S {
+            fn write_str(&mut self, t: &str) -> core::fmt::Result {
+                self.buf[self.len..self.len + t.len()].copy_from_slice(t.as_bytes());
+                self.len += t.len();
+                Ok(())
+            }
+        }
     }
 }

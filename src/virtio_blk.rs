@@ -16,6 +16,10 @@ use core::sync::atomic::{fence, Ordering};
 use novafs::{Block, BlockDevice, IoError, BLOCK_SIZE};
 
 const VENDOR_VIRTIO: u16 = 0x1AF4;
+
+/// The disk's I/O base (0 until the disk is found). Its interrupt line may be shared with the
+/// network card's; the interrupt handler reads this ISR register too, or the line never drops.
+pub static IO_BASE: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
 const DEVICE_BLOCK_LEGACY: u16 = 0x1001;
 
 // Legacy register offsets from the I/O base (BAR0).
@@ -72,6 +76,7 @@ unsafe fn init(device: &PciDevice) -> Result<VirtioBlk, &'static str> {
         return Err("virtio BAR0 is not an I/O port range");
     }
     let io = (bar0 & !3) as u16;
+    IO_BASE.store(io, core::sync::atomic::Ordering::Relaxed);
     device.enable(pci::COMMAND_IO_SPACE | pci::COMMAND_BUS_MASTER);
 
     outb(io + REG_STATUS, 0); // reset

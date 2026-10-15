@@ -40,6 +40,9 @@ use crate::{proc, sched, serial, timer};
 // Screen, input and window calls live in their own file but share this module's helpers.
 #[path = "syscall_gfx.rs"]
 mod gfx;
+// Sockets, ping, name lookup, clock.
+#[path = "syscall_net.rs"]
+mod netcalls;
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -78,6 +81,20 @@ const SYS_WIN_POST: u64 = 28;
 const SYS_WIN_EVENT: u64 = 29;
 const SYS_WIN_FLUSH: u64 = 30;
 const SYS_FD_READY: u64 = 31;
+const SYS_SOCKET: u64 = 32;
+const SYS_BIND: u64 = 33;
+const SYS_SENDTO: u64 = 34;
+const SYS_RECVFROM: u64 = 35;
+const SYS_CONNECT: u64 = 36;
+const SYS_NETINFO: u64 = 39;
+const SYS_RESOLVE: u64 = 40;
+const SYS_PING: u64 = 41;
+const SYS_CLOCK_US: u64 = 42;
+const SYS_SHUTDOWN: u64 = 43;
+const SYS_GETSOCKNAME: u64 = 44;
+const SYS_GETPEERNAME: u64 = 45;
+const SYS_LISTEN: u64 = 37;
+const SYS_ACCEPT: u64 = 38;
 
 const E2BIG: i64 = -7;
 const ENOEXEC: i64 = -8;
@@ -196,6 +213,20 @@ extern "C" fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> 
         SYS_WIN_EVENT => gfx::sys_win_event(a1, a2, a3),
         SYS_WIN_FLUSH => gfx::sys_win_flush(a1),
         SYS_FD_READY => sys_fd_ready(a1),
+        SYS_SOCKET => netcalls::sys_socket(a1),
+        SYS_BIND => netcalls::sys_bind(a1, a2),
+        SYS_SENDTO => netcalls::sys_sendto(a1, a2, a3, a4),
+        SYS_RECVFROM => netcalls::sys_recvfrom(a1, a2, a3, a4, a5),
+        SYS_CONNECT => netcalls::sys_connect(a1, a2, a3),
+        SYS_LISTEN => netcalls::sys_listen(a1, a2),
+        SYS_ACCEPT => netcalls::sys_accept(a1, a2, a3),
+        SYS_SHUTDOWN => netcalls::sys_shutdown(a1, a2),
+        SYS_GETSOCKNAME => netcalls::sys_getsockname(a1, a2),
+        SYS_GETPEERNAME => netcalls::sys_getpeername(a1, a2),
+        SYS_NETINFO => netcalls::sys_netinfo(a1),
+        SYS_RESOLVE => netcalls::sys_resolve(a1, a2, a3, a4),
+        SYS_PING => netcalls::sys_ping(a1, a2, a3),
+        SYS_CLOCK_US => netcalls::sys_clock_us(),
         SYS_EXIT => proc::exit_current(a1 as i64),
         SYS_WRITE => sys_write(a1, a2, a3),
         SYS_READ => sys_read(a1, a2, a3),
@@ -257,6 +288,14 @@ fn sys_write(fd: u64, ptr: u64, len: u64) -> i64 {
             Ok(n) => n as i64,
             Err(e) => e,
         },
+        File::Tcp(sock) => match sock.send(&bytes) {
+            Ok(n) => n as i64,
+            Err(e) => e,
+        },
+        File::Udp(sock) => match sock.send_to(&bytes, None) {
+            Ok(n) => n as i64,
+            Err(e) => e,
+        },
     }
 }
 
@@ -283,6 +322,20 @@ fn sys_read(fd: u64, ptr: u64, len: u64) -> i64 {
         File::PipeWrite(_) => return EBADF,
         File::Disk(file) => match file.read(&mut buf) {
             Ok(n) => n,
+            Err(e) => return e,
+        },
+        File::Tcp(sock) => match sock.recv(buf.len(), None) {
+            Ok(data) => {
+                buf[..data.len()].copy_from_slice(&data);
+                data.len()
+            }
+            Err(e) => return e,
+        },
+        File::Udp(sock) => match sock.recv_from(buf.len(), None) {
+            Ok((data, _, _)) => {
+                buf[..data.len()].copy_from_slice(&data);
+                data.len()
+            }
             Err(e) => return e,
         },
     };
@@ -614,6 +667,8 @@ fn sys_fd_ready(fd: u64) -> i64 {
         File::PipeRead(pipe) => pipe.ready(),
         File::PipeWrite(pipe) => pipe.ready(),
         File::Disk(_) => true,
+        File::Udp(sock) => sock.ready(),
+        File::Tcp(sock) => sock.ready(),
     };
     ready as i64
 }

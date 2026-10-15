@@ -14,6 +14,7 @@ mod keyboard;
 mod limine;
 mod mem;
 mod mouse;
+mod net;
 mod pci;
 mod pic;
 mod port;
@@ -25,6 +26,7 @@ mod syscall;
 mod timer;
 mod vfs;
 mod virtio_blk;
+mod virtio_net;
 mod winsys;
 
 use core::arch::asm;
@@ -77,6 +79,8 @@ extern "C" fn _start() -> ! {
     pic::init();
     timer::init(TIMER_HZ);
     println!("[ok] PIC remapped, PIT at {} Hz", TIMER_HZ);
+    timer::calibrate_tsc();
+    println!("[ok] clock: cycle counter at {} MHz", timer::tsc_khz() / 1000);
 
     if let Some((w, h, _, _)) = screen {
         input::set_bounds(w, h);
@@ -116,6 +120,11 @@ extern "C" fn _start() -> ! {
             }
         }
         Err(reason) => println!("[disk] not available: {}", reason),
+    }
+
+    net::init();
+    if selftest {
+        net::self_test();
     }
 
     syscall::init();

@@ -270,6 +270,20 @@ pub mod errno {
     pub const EBUSY: i64 = -16;
     pub const ENODEV: i64 = -19;
     pub const EINVAL: i64 = -22;
+    pub const EAGAIN: i64 = -11;
+    pub const EMFILE: i64 = -24;
+    pub const EPIPE: i64 = -32;
+    pub const ENOTSOCK: i64 = -88;
+    pub const EDESTADDRREQ: i64 = -89;
+    pub const EMSGSIZE: i64 = -90;
+    pub const EADDRINUSE: i64 = -98;
+    pub const EADDRNOTAVAIL: i64 = -99;
+    pub const ENETDOWN: i64 = -100;
+    pub const ENETUNREACH: i64 = -101;
+    pub const ECONNRESET: i64 = -104;
+    pub const ENOTCONN: i64 = -107;
+    pub const ETIMEDOUT: i64 = -110;
+    pub const ECONNREFUSED: i64 = -111;
 }
 
 /// Wait as long as it takes.
@@ -349,6 +363,105 @@ pub fn win_flush(id: u32) -> i64 {
     unsafe { syscall(SYS_WIN_FLUSH, id as u64, 0, 0, 0, 0) }
 }
 
+// ---- networking ------------------------------------------------------------------------------
+
+pub const SYS_SOCKET: u64 = 32;
+pub const SYS_BIND: u64 = 33;
+pub const SYS_SENDTO: u64 = 34;
+pub const SYS_RECVFROM: u64 = 35;
+pub const SYS_CONNECT: u64 = 36;
+pub const SYS_NETINFO: u64 = 39;
+pub const SYS_RESOLVE: u64 = 40;
+pub const SYS_PING: u64 = 41;
+pub const SYS_CLOCK_US: u64 = 42;
+
+pub const SOCK_UDP: u64 = 1;
+pub const SOCK_TCP: u64 = 2;
+pub const SYS_LISTEN: u64 = 37;
+pub const SYS_ACCEPT: u64 = 38;
+pub const SYS_SHUTDOWN: u64 = 43;
+pub const SYS_GETSOCKNAME: u64 = 44;
+pub const SYS_GETPEERNAME: u64 = 45;
+
+/// A new socket; returns its descriptor.
+pub fn socket(kind: u64) -> i64 {
+    unsafe { syscall(SYS_SOCKET, kind, 0, 0, 0, 0) }
+}
+
+/// Claim a local port (0 = any free one); returns the port.
+pub fn bind(fd: u64, port: u16) -> i64 {
+    unsafe { syscall(SYS_BIND, fd, port as u64, 0, 0, 0) }
+}
+
+/// Send one datagram to `to` (or to the connected peer if None); returns bytes sent.
+pub fn sendto(fd: u64, data: &[u8], to: Option<&SockAddr>) -> i64 {
+    let addr = to.map_or(0, |a| a as *const SockAddr as u64);
+    unsafe { syscall(SYS_SENDTO, fd, data.as_ptr() as u64, data.len() as u64, addr, 0) }
+}
+
+/// Receive one datagram (cut to `buf`'s size). `timeout_ticks`: 0 only looks, FOREVER waits.
+pub fn recvfrom(fd: u64, buf: &mut [u8], from: Option<&mut SockAddr>, timeout_ticks: u64) -> i64 {
+    let addr = from.map_or(0, |a| a as *mut SockAddr as u64);
+    unsafe { syscall(SYS_RECVFROM, fd, buf.as_mut_ptr() as u64, buf.len() as u64, addr, timeout_ticks) }
+}
+
+/// UDP: set the default peer. TCP: open the connection and wait for it (FOREVER).
+pub fn connect(fd: u64, to: &SockAddr) -> i64 {
+    connect_timeout(fd, to, FOREVER)
+}
+
+/// Like `connect`, but a TCP connection attempt gives up after `timeout_ticks`.
+pub fn connect_timeout(fd: u64, to: &SockAddr, timeout_ticks: u64) -> i64 {
+    unsafe { syscall(SYS_CONNECT, fd, to as *const SockAddr as u64, timeout_ticks, 0, 0) }
+}
+
+/// TCP: start accepting connections on the port given to `bind`.
+pub fn listen(fd: u64, backlog: u64) -> i64 {
+    unsafe { syscall(SYS_LISTEN, fd, backlog, 0, 0, 0) }
+}
+
+/// TCP: the next connection as a new descriptor; `peer` gets the client's address.
+pub fn accept(fd: u64, peer: Option<&mut SockAddr>, timeout_ticks: u64) -> i64 {
+    let addr = peer.map_or(0, |a| a as *mut SockAddr as u64);
+    unsafe { syscall(SYS_ACCEPT, fd, addr, timeout_ticks, 0, 0) }
+}
+
+pub const SHUT_WR: u64 = 1;
+
+/// TCP: stop sending; the other side reads end-of-file once it has everything.
+pub fn shutdown(fd: u64, how: u64) -> i64 {
+    unsafe { syscall(SYS_SHUTDOWN, fd, how, 0, 0, 0) }
+}
+
+pub fn getsockname(fd: u64, out: &mut SockAddr) -> i64 {
+    unsafe { syscall(SYS_GETSOCKNAME, fd, out as *mut SockAddr as u64, 0, 0, 0) }
+}
+
+pub fn getpeername(fd: u64, out: &mut SockAddr) -> i64 {
+    unsafe { syscall(SYS_GETPEERNAME, fd, out as *mut SockAddr as u64, 0, 0, 0) }
+}
+
+pub fn netinfo(out: &mut NetInfo) -> i64 {
+    unsafe { syscall(SYS_NETINFO, out as *mut NetInfo as u64, 0, 0, 0, 0) }
+}
+
+/// Look up `name` (NUL-terminated; a dotted address is returned as is). `server` overrides
+/// the resolver the network gave us.
+pub fn resolve(name: &[u8], out: &mut [u8; 4], timeout_ticks: u64, server: Option<&SockAddr>) -> i64 {
+    let srv = server.map_or(0, |s| s as *const SockAddr as u64);
+    unsafe { syscall(SYS_RESOLVE, name.as_ptr() as u64, out.as_mut_ptr() as u64, timeout_ticks, srv, 0) }
+}
+
+/// Send one echo request; returns the round trip in microseconds, or a negative error.
+pub fn ping(ip: [u8; 4], payload_len: u64, timeout_ticks: u64) -> i64 {
+    unsafe { syscall(SYS_PING, u32::from_be_bytes(ip) as u64, payload_len, timeout_ticks, 0, 0) }
+}
+
+/// Microseconds since boot.
+pub fn clock_us() -> u64 {
+    unsafe { syscall(SYS_CLOCK_US, 0, 0, 0, 0, 0) as u64 }
+}
+
 pub fn strerror(code: i64) -> &'static str {
     match code {
         -1 => "Operation not permitted",
@@ -374,6 +487,18 @@ pub fn strerror(code: i64) -> &'static str {
         -38 => "Function not implemented",
         -39 => "Directory not empty",
         -117 => "Filesystem is corrupted",
+        -11 => "Resource temporarily unavailable",
+        -88 => "Not a socket",
+        -89 => "Destination address required",
+        -90 => "Message too long",
+        -98 => "Address already in use",
+        -99 => "Cannot assign requested address",
+        -100 => "Network is down",
+        -101 => "Network is unreachable",
+        -104 => "Connection reset by peer",
+        -107 => "Socket is not connected",
+        -110 => "Connection timed out",
+        -111 => "Connection refused",
         _ => "Unknown error",
     }
 }
@@ -537,6 +662,22 @@ impl<const N: usize> CString<N> {
         true
     }
 
+    pub fn clear(&mut self) {
+        self.len = 0;
+        self.buf[0] = 0;
+    }
+
+    /// A copy of `s`, cut off if it does not fit.
+    pub fn from_str(s: &str) -> Self {
+        let mut c = Self::new();
+        let mut end = s.len().min(N.saturating_sub(1));
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        c.push_str(&s[..end]);
+        c
+    }
+
     pub fn len(&self) -> usize {
         self.len
     }
@@ -554,4 +695,15 @@ impl<const N: usize> CString<N> {
 /// Report `what: message` for a failed system call, as `program: what: message`.
 pub fn report(program: &str, what: &str, code: i64) {
     eprintln!("{}: {}: {}", program, what, strerror(code));
+}
+
+/// `write!(string, "...")` into a CString; an error if the text does not fit.
+impl<const N: usize> fmt::Write for CString<N> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        if self.push_str(s) {
+            Ok(())
+        } else {
+            Err(fmt::Error)
+        }
+    }
 }

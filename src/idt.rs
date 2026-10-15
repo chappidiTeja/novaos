@@ -9,6 +9,13 @@ pub const IRQ_TIMER: u8 = pic::IRQ_BASE;
 pub const IRQ_KEYBOARD: u8 = pic::IRQ_BASE + 1;
 pub const IRQ_SERIAL: u8 = pic::IRQ_BASE + 4;
 pub const IRQ_MOUSE: u8 = pic::IRQ_BASE + 12;
+// PCI devices (the network card) get one of these lines from the firmware.
+pub const IRQ_SPURIOUS_7: u8 = pic::IRQ_BASE + 7;
+pub const IRQ_SPURIOUS_15: u8 = pic::IRQ_BASE + 15;
+pub const IRQ_PCI_5: u8 = pic::IRQ_BASE + 5;
+pub const IRQ_PCI_9: u8 = pic::IRQ_BASE + 9;
+pub const IRQ_PCI_10: u8 = pic::IRQ_BASE + 10;
+pub const IRQ_PCI_11: u8 = pic::IRQ_BASE + 11;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -79,6 +86,12 @@ pub fn init() {
     set(IRQ_KEYBOARD, keyboard_irq as *const () as usize, 0);
     set(IRQ_SERIAL, serial_irq as *const () as usize, 0);
     set(IRQ_MOUSE, mouse_irq as *const () as usize, 0);
+    set(IRQ_SPURIOUS_7, spurious7_irq as *const () as usize, 0);
+    set(IRQ_SPURIOUS_15, spurious15_irq as *const () as usize, 0);
+    set(IRQ_PCI_5, pci5_irq as *const () as usize, 0);
+    set(IRQ_PCI_9, pci9_irq as *const () as usize, 0);
+    set(IRQ_PCI_10, pci10_irq as *const () as usize, 0);
+    set(IRQ_PCI_11, pci11_irq as *const () as usize, 0);
 
     let ptr = DescriptorPointer {
         limit: (size_of::<[Entry; 256]>() - 1) as u16,
@@ -168,4 +181,32 @@ extern "x86-interrupt" fn serial_irq(_frame: InterruptStackFrame) {
         crate::ipc::console::push_input(byte);
     }
     pic::end_of_interrupt(IRQ_SERIAL);
+}
+
+// One handler per possible PCI line (a handler cannot know which vector called it).
+macro_rules! pci_irq_handler {
+    ($name:ident, $vector:expr) => {
+        extern "x86-interrupt" fn $name(_frame: InterruptStackFrame) {
+            crate::net::interrupt();
+            pic::end_of_interrupt($vector);
+        }
+    };
+}
+
+pci_irq_handler!(pci5_irq, IRQ_PCI_5);
+pci_irq_handler!(pci9_irq, IRQ_PCI_9);
+pci_irq_handler!(pci10_irq, IRQ_PCI_10);
+pci_irq_handler!(pci11_irq, IRQ_PCI_11);
+
+// IRQ 7 and 15 can be spurious (see pic::is_real_irq). A spurious one gets no real
+// acknowledgement, and if the PIC really had a device behind it, there is nothing to do here:
+// no device uses these lines.
+extern "x86-interrupt" fn spurious7_irq(_frame: InterruptStackFrame) {
+    let real = pic::is_real_irq(7);
+    pic::end_of_spurious(7, real);
+}
+
+extern "x86-interrupt" fn spurious15_irq(_frame: InterruptStackFrame) {
+    let real = pic::is_real_irq(15);
+    pic::end_of_spurious(15, real);
 }

@@ -22,6 +22,14 @@ members = [
     "desktop",
     "term",
     "gdemo",
+    "ifconfig",
+    "ping",
+    "nslookup",
+    "nettest",
+    "fetch",
+    "httpd",
+    "nc",
+    "cksum",
 ]
 
 [profile.release]

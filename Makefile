@@ -7,14 +7,17 @@ DESKTOP_ISO := novaos-desktop.iso
 USER_OUT  := user/target/x86_64-unknown-none/release
 USER_ELF  := build/hello.elf
 # Programs that go to /bin on the disk. `hello` is also embedded in the kernel for its tests.
-USER_BINS := hello sh ls cat echo mkdir rm rmdir touch wc cp gfxtest desktop term gdemo
+USER_BINS := hello sh ls cat echo mkdir rm rmdir touch wc cp gfxtest desktop term gdemo ifconfig ping nslookup nettest fetch httpd nc cksum
 MKFS      := tools/mkfs/target/x86_64-unknown-linux-gnu/release/mkfs
 DISK      := build/disk.img
 
 # The OS disk: a virtio block device, legacy interface only.
 QEMU_DISK = -drive file=$(1),if=none,id=disk0,format=raw -device virtio-blk-pci,drive=disk0,disable-modern=on
 
-.PHONY: all user kernel iso mkfs rootfs disk run test test-shell test-screen test-screen-selftest test-gfx test-user-libs test-desktop test-desktop-boot run-desktop test-persistence test-crash test-fs clean
+# A network card on QEMU's built-in user-mode network (DHCP gives 10.0.2.15, gateway 10.0.2.2).
+QEMU_NET = -netdev user,id=net0 -device virtio-net-pci,netdev=net0,disable-modern=on
+
+.PHONY: regress test-net test-net-stack all user kernel iso mkfs rootfs disk run test test-shell test-screen test-screen-selftest test-gfx test-user-libs test-desktop test-desktop-boot run-desktop test-persistence test-crash test-fs clean
 
 all: iso
 
@@ -64,7 +67,7 @@ rootfs: user
 	rm -rf build/rootfs
 	mkdir -p build/rootfs/bin build/rootfs/tmp build/rootfs/var build/rootfs/test build/rootfs/etc build/rootfs/docs
 	cp -r rootfs/. build/rootfs/
-	find build/rootfs -type f \( -name '*.txt' -o -name motd \) -exec sed -i 's/\r$$//' {} +
+	find build/rootfs -type f \( -name '*.txt' -o -name '*.html' -o -name '*.css' -o -name motd \) -exec sed -i 's/\r$$//' {} +
 	for b in $(USER_BINS); do cp $(USER_OUT)/$$b build/rootfs/bin/$$b; done
 	python3 -c "import sys; sys.stdout.buffer.write(bytes((i ^ (i>>8) ^ (i>>16)) & 255 for i in range(1572864)))" > build/rootfs/test/pattern.bin
 
@@ -75,7 +78,7 @@ disk: mkfs rootfs
 # Changes made to the disk persist in build/disk-run.img between runs.
 run: iso disk
 	test -f build/disk-run.img || cp $(DISK) build/disk-run.img
-	qemu-system-x86_64 -cdrom $(ISO) -m 512M $(call QEMU_DISK,build/disk-run.img) -serial stdio -display none -no-reboot
+	qemu-system-x86_64 -cdrom $(ISO) -m 512M $(call QEMU_DISK,build/disk-run.img) $(QEMU_NET) -serial stdio -display none -no-reboot
 
 # The same, but straight into the graphical desktop, in a window (needs a machine
 # with a display; the build server has none).
@@ -86,7 +89,7 @@ run-desktop: iso disk
 # Non-interactive: boot on a fresh copy of the disk, then check the serial log.
 test: iso disk
 	cp $(DISK) build/disk-test.img
-	-timeout 40 qemu-system-x86_64 -cdrom $(TEST_ISO) -m 512M $(call QEMU_DISK,build/disk-test.img) -serial file:serial.log -display none -no-reboot
+	-timeout 60 qemu-system-x86_64 -cdrom $(TEST_ISO) -m 512M $(call QEMU_DISK,build/disk-test.img) $(QEMU_NET) -serial file:serial.log -display none -no-reboot
 	@cat serial.log
 	@grep -q "BREAKPOINT" serial.log && grep -q "\[ok\] timer" serial.log \
 		&& grep -q "\[ok\] pmm self-test" serial.log && grep -q "\[ok\] vmm self-test" serial.log \
@@ -94,6 +97,7 @@ test: iso disk
 		&& grep -q "\[ok\] scheduler self-test" serial.log \
 		&& grep -q "\[ok\] ipc self-test" serial.log \
 		&& grep -q "\[ok\] disk self-test" serial.log \
+		&& grep -q "\[ok\] net self-test" serial.log \
 		&& grep -q "hello from user mode" serial.log \
 		&& grep -q "\[ok\] user-mode self-test" serial.log \
 		&& grep -q "\[ok\] gfx: screen released after exit and after a crash; a second run leaks nothing" serial.log \
@@ -151,3 +155,16 @@ clean:
 	cd tools/mkfs && cargo clean
 	cd fs && cargo clean
 	rm -rf iso_root build $(ISO) $(TEST_ISO) serial.log
+
+# The network stack's own unit tests, on the build machine.
+test-net-stack:
+	cd net && RUSTFLAGS="" cargo test --release --target x86_64-unknown-linux-gnu
+
+# The network end to end: boots with a card on QEMU's user network, runs ping, nslookup and the
+# socket tests, with a UDP echo server and a DNS server running on the host (scripts/net_test.sh).
+test-net: iso disk
+	bash scripts/net_test.sh $(ISO) $(DISK)
+
+# Every test target in turn, one verdict line each (10-20 minutes).
+regress:
+	bash scripts/regress.sh

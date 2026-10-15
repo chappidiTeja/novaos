@@ -62,6 +62,11 @@ impl PciDevice {
         read32(self.addr, 0x10 + 4 * index)
     }
 
+    /// The interrupt line (0-15) the firmware routed this device to; 0xFF if none.
+    pub fn irq_line(&self) -> u8 {
+        read32(self.addr, 0x3C) as u8
+    }
+
     /// Allow the device to respond to I/O ports and to DMA into memory.
     pub fn enable(&self, flags: u16) {
         let current = read32(self.addr, COMMAND);
