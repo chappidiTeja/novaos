@@ -76,6 +76,26 @@ unsafe fn syscall(nr: u64, a1: u64, a2: u64, a3: u64) -> i64 {
     ret
 }
 
+
+/// The five-argument form (rdi, rsi, rdx, r10, r8).
+#[inline(always)]
+unsafe fn syscall5(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64 {
+    let ret: i64;
+    asm!(
+        "syscall",
+        inlateout("rax") nr as i64 => ret,
+        inlateout("rdi") a1 => _,
+        inlateout("rsi") a2 => _,
+        inlateout("rdx") a3 => _,
+        inlateout("r10") a4 => _,
+        inlateout("r8") a5 => _,
+        out("r9") _,
+        out("rcx") _,
+        out("r11") _,
+        options(nostack),
+    );
+    ret
+}
 fn write(fd: u64, ptr: u64, len: u64) -> i64 {
     unsafe { syscall(SYS_WRITE, fd, ptr, len) }
 }
@@ -148,6 +168,12 @@ pub extern "C" fn _start(mode: u64) -> ! {
         14 => pipe_syscalls(),
         15 => broken_pipe(),
         16 => fs_syscalls(),
+        17 => spin(false),
+        18 => block_on_pipe(),
+        19 => sleeper(),
+        20 => spin(true),
+        21 => block_on_console(),
+        22 => wait_for_spinning_child(),
         _ => exit(99),
     }
 }
@@ -692,4 +718,60 @@ fn write_to_code() -> ! {
 fn panic(_info: &PanicInfo) -> ! {
     print("user panic\n");
     exit(100)
+}
+
+// ---- signals: processes for the kernel's self-test to kill ---------------------------------------
+
+const SYS_SPAWN: u64 = 19;
+const SYS_WAITPID: u64 = 20;
+const SYS_SIGIGNORE: u64 = 47;
+const SIGTERM_BIT: u64 = 1 << 15;
+const SIGINT_BIT: u64 = 1 << 2;
+
+/// Loop in ring 3 without ever making a system call: only a timer interrupt can reach us.
+/// With `ignore`, SIGTERM and SIGINT are ignored first (SIGKILL still works).
+fn spin(ignore: bool) -> ! {
+    if ignore {
+        unsafe { syscall(SYS_SIGIGNORE, SIGTERM_BIT | SIGINT_BIT, 0, 0) };
+    }
+    let mut n: u64 = 0;
+    loop {
+        n = black_box(n.wrapping_add(1));
+    }
+}
+
+/// Wait for a pipe that nobody will ever write to (this process holds the write end too).
+fn block_on_pipe() -> ! {
+    let mut fds = [0u64; 2];
+    unsafe { syscall(SYS_PIPE, fds.as_mut_ptr() as u64, 0, 0) };
+    let mut buf = [0u8; 8];
+    loop {
+        unsafe { syscall(SYS_READ, fds[0], buf.as_mut_ptr() as u64, 8) };
+    }
+}
+
+/// Sleep, over and over.
+fn sleeper() -> ! {
+    loop {
+        sleep(1000);
+    }
+}
+
+/// Read the console, which nobody types on.
+fn block_on_console() -> ! {
+    let mut buf = [0u8; 8];
+    loop {
+        unsafe { syscall(SYS_READ, 0, buf.as_mut_ptr() as u64, 8) };
+    }
+}
+
+/// Start a child (this same program in spin mode: argc 17 is its mode) and wait for it.
+fn wait_for_spinning_child() -> ! {
+    let argv = [0u8; 17]; // seventeen empty strings
+    let child = unsafe { syscall5(SYS_SPAWN, b"/bin/hello\0".as_ptr() as u64, argv.as_ptr() as u64, 17, 17, 0) };
+    if child < 0 {
+        exit(98);
+    }
+    let status = unsafe { syscall(SYS_WAITPID, child as u64, 0, 0) };
+    exit(status);
 }

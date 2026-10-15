@@ -4,4 +4,5 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-nova = { path = "../lib" }
+nova = { path = "../lib", features = ["heap"] }
+novashell = { path = "../shell" }

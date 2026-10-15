@@ -157,12 +157,17 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: u64) {
     fatal("PAGE FAULT (#PF)", 14, &frame, Some(code))
 }
 
-extern "x86-interrupt" fn timer_irq(_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn timer_irq(frame: InterruptStackFrame) {
     timer::tick();
     // Acknowledge first: the scheduler below may switch to another thread and
     // not come back for a while, and the PIC sends no more timer IRQs until EOI.
     pic::end_of_interrupt(IRQ_TIMER);
     sched::on_tick();
+    // Ring-3 code that was interrupted holds no kernel locks, so a process with a fatal signal
+    // pending (a CPU-bound loop never makes a system call) can be finished off right here.
+    if frame.cs & 3 == 3 {
+        crate::proc::act_on_signals();
+    }
 }
 
 extern "x86-interrupt" fn keyboard_irq(_frame: InterruptStackFrame) {

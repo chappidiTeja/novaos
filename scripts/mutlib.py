@@ -49,7 +49,8 @@ def make(work, target, timeout):
 
 
 def compile_failed(log):
-    return re.search(r"^error(\[E\d+\])?:", log, re.M) is not None or "could not compile" in log
+    # "error: test failed" is a failing test, not a compile error.
+    return re.search(r"^error\[E\d+\]", log, re.M) is not None or "could not compile" in log or "aborting due to" in log
 
 
 def first_failures(log, n=3):

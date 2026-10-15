@@ -29,6 +29,11 @@ fn pattern(n: usize, seed: u64) -> Vec<u8> {
 
 // ---- the simulated network ---------------------------------------------------------------
 
+thread_local! {
+    /// When this test (a thread of its own) began: the budget covers all the networks it builds.
+    static TEST_BORN: std::time::Instant = std::time::Instant::now();
+}
+
 struct Net {
     a: Stack,
     b: Stack,
@@ -47,6 +52,9 @@ struct Net {
     extra_delay: Option<Box<dyn FnMut(u8, &[u8]) -> u64>>,
     frames: [u64; 2],
     dropped: u64,
+    /// When the test began: a stack that is badly broken makes tests spin for minutes, so a
+    /// test that has used up its wall-clock budget fails instead.
+    started: std::time::Instant,
 }
 
 impl Net {
@@ -66,6 +74,7 @@ impl Net {
     }
 
     fn bare(a: Stack, b: Stack) -> Net {
+        TEST_BORN.with(|_| ()); // start the test's clock
         Net {
             a,
             b,
@@ -81,6 +90,7 @@ impl Net {
             extra_delay: None,
             frames: [0; 2],
             dropped: 0,
+            started: std::time::Instant::now(),
         }
     }
 
@@ -100,6 +110,9 @@ impl Net {
 
     fn tick(&mut self) {
         self.now += 1;
+        if self.now % 4096 == 0 && TEST_BORN.with(|b| b.elapsed().as_secs()) > 25 {
+            panic!("this test has used its wall-clock budget (25 s): the stacks are stuck or very slow");
+        }
         let now = self.now;
         // Deliver what is due, oldest first.
         self.queue.sort_by_key(|(at, _, _)| *at);

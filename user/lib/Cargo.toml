@@ -5,3 +5,8 @@ edition = "2021"
 
 [dependencies]
 novaabi = { path = "../abi" }
+# The heap is opt-in: a program that enables the `heap` feature can use Vec, String and Box.
+novaheap = { path = "../heap", optional = true }
+
+[features]
+heap = ["novaheap"]

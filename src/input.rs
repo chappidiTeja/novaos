@@ -172,11 +172,17 @@ fn push_to_owner(event: Event) {
 }
 
 /// A key was typed. It goes to the owner if there is one, otherwise to stdin.
-pub fn key(ch: u8) {
+pub fn key(code: u32) {
     if owner() != 0 {
-        push_to_owner(Event::new(EV_KEY, ch as i32, 0, 0));
+        push_to_owner(Event::new(EV_KEY, code as i32, 0, 0));
     } else {
-        crate::ipc::console::push_input(ch);
+        if code < 0x100 {
+            crate::ipc::console::push_input(code as u8);
+        } else {
+            for &b in crate::keyboard::escape_sequence(code) {
+                crate::ipc::console::push_input(b);
+            }
+        }
     }
 }
 
@@ -226,12 +232,14 @@ pub fn next(timeout_ticks: Option<u64>) -> Option<Event> {
         None => false,
     };
     match timeout_ticks {
-        None => READABLE.wait_until(&mut take),
+        None => {
+            READABLE.wait_until_intr(&mut take);
+        }
         Some(0) => {
             take();
         }
         Some(ticks) => {
-            READABLE.wait_until_deadline(timer::ticks() + ticks, &mut take);
+            READABLE.wait_until_deadline_intr(timer::ticks() + ticks, &mut take);
         }
     }
     got

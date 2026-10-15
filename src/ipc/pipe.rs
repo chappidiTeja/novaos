@@ -58,7 +58,7 @@ impl PipeReader {
         }
         let pipe = &*self.0;
         let mut n = 0;
-        pipe.readable.wait_until(|| {
+        pipe.readable.wait_until_intr(|| {
             let mut state = pipe.state.lock();
             if state.buf.is_empty() && state.writers > 0 {
                 return false;
@@ -98,7 +98,7 @@ impl PipeWriter {
             let chunk = &data[written..];
             let mut progressed = 0;
             let mut broken = false;
-            pipe.writable.wait_until(|| {
+            let met = pipe.writable.wait_until_intr(|| {
                 let mut state = pipe.state.lock();
                 if state.readers == 0 {
                     broken = true;
@@ -113,6 +113,10 @@ impl PipeWriter {
                 progressed = n;
                 true
             });
+            if !met {
+                // The writer was sent a signal that ends it: stop, what we wrote stays written.
+                return Ok(written);
+            }
             if broken {
                 return if written > 0 { Ok(written) } else { Err(BrokenPipe) };
             }

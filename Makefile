@@ -7,7 +7,7 @@ DESKTOP_ISO := novaos-desktop.iso
 USER_OUT  := user/target/x86_64-unknown-none/release
 USER_ELF  := build/hello.elf
 # Programs that go to /bin on the disk. `hello` is also embedded in the kernel for its tests.
-USER_BINS := hello sh ls cat echo mkdir rm rmdir touch wc cp gfxtest desktop term gdemo ifconfig ping nslookup nettest fetch httpd nc cksum
+USER_BINS := hello sh ls cat echo mkdir rm rmdir touch wc cp gfxtest desktop term gdemo ifconfig ping nslookup nettest fetch httpd nc cksum ps kill sleep printenv
 MKFS      := tools/mkfs/target/x86_64-unknown-linux-gnu/release/mkfs
 DISK      := build/disk.img
 
@@ -143,7 +143,7 @@ test-desktop-boot: iso disk
 # Unit tests of the user-space libraries (shared types, drawing, window manager),
 # run on the build machine.
 test-user-libs:
-	cd user && RUSTFLAGS="" cargo test --release --target x86_64-unknown-linux-gnu -p novaabi -p gfx -p wm
+	cd user && RUSTFLAGS="" cargo test --release --target x86_64-unknown-linux-gnu -p novaabi -p novaheap -p novashell -p novaregex -p gfx -p wm
 
 # The filesystem's own unit tests, on the build machine.
 test-fs:

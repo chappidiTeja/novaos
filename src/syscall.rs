@@ -94,6 +94,13 @@ const SYS_SHUTDOWN: u64 = 43;
 const SYS_GETSOCKNAME: u64 = 44;
 const SYS_GETPEERNAME: u64 = 45;
 const SYS_LISTEN: u64 = 37;
+const SYS_KILL: u64 = 46;
+const SYS_SIGIGNORE: u64 = 47;
+const SYS_SETFG: u64 = 48;
+const SYS_PROCLIST: u64 = 49;
+const SYS_GETPPID: u64 = 50;
+const SYS_SPAWN2: u64 = 51;
+const SYS_WAIT: u64 = 53;
 const SYS_ACCEPT: u64 = 38;
 
 const E2BIG: i64 = -7;
@@ -198,7 +205,15 @@ pub fn set_kernel_stack(top: u64) {
     unsafe { core::ptr::addr_of_mut!(KERNEL_RSP).write_volatile(top) };
 }
 
+/// Every system call goes through here: run it, then let a signal that was sent to the caller
+/// (during the call, or while it slept in it) end the process.
 extern "C" fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64 {
+    let result = dispatch_inner(nr, a1, a2, a3, a4, a5);
+    proc::act_on_signals();
+    result
+}
+
+fn dispatch_inner(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64 {
     match nr {
         SYS_SPAWN => sys_spawn(a1, a2, a3, a4, a5),
         SYS_WAITPID => sys_waitpid(a1),
@@ -221,6 +236,19 @@ extern "C" fn dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> 
         SYS_LISTEN => netcalls::sys_listen(a1, a2),
         SYS_ACCEPT => netcalls::sys_accept(a1, a2, a3),
         SYS_SHUTDOWN => netcalls::sys_shutdown(a1, a2),
+        SYS_KILL => sys_kill(a1, a2),
+        SYS_SIGIGNORE => {
+            proc::set_ignored(a1 as u32);
+            0
+        }
+        SYS_SETFG => {
+            console::set_foreground(a1);
+            0
+        }
+        SYS_PROCLIST => sys_proclist(a1, a2),
+        SYS_GETPPID => sched::current_user_handle().map_or(0, |h| h.ppid as i64),
+        SYS_SPAWN2 => sys_spawn2(a1),
+        SYS_WAIT => sys_wait(a1, a2, a3),
         SYS_GETSOCKNAME => netcalls::sys_getsockname(a1, a2),
         SYS_GETPEERNAME => netcalls::sys_getpeername(a1, a2),
         SYS_NETINFO => netcalls::sys_netinfo(a1),
@@ -505,7 +533,82 @@ fn sys_path_op(path_ptr: u64, op: fn(&str, u32) -> Result<(), i64>) -> i64 {
     }
 }
 
+/// spawn(path, argv, argv_len, argc, stdio): the child gets our descriptors `stdio[0..3]` as its
+/// 0, 1 and 2 (or our own 0, 1, 2 if `stdio` is 0), our working directory and our environment.
 fn sys_spawn(path_ptr: u64, argv_ptr: u64, argv_len: u64, argc: u64, stdio_ptr: u64) -> i64 {
+    let mapping: [(usize, u64); 3] = if stdio_ptr == 0 {
+        [(0, 0), (1, 1), (2, 2)]
+    } else {
+        match copy_from_user(stdio_ptr, 24) {
+            Ok(raw) => {
+                let word = |i: usize| u64::from_le_bytes(raw[8 * i..8 * i + 8].try_into().unwrap());
+                [(0, word(0)), (1, word(1)), (2, word(2))]
+            }
+            Err(e) => return e,
+        }
+    };
+    spawn_common(path_ptr, argv_ptr, argv_len, argc, &mapping, None, 0)
+}
+
+/// spawn2(req): like spawn, with more control. `req` points to ten u64: path, argv, argv_len,
+/// argc, fds, nfds, env, env_len, flags, pgid. `fds` is `nfds` pairs (child descriptor, our
+/// descriptor); with nfds = 0 the child gets our 0, 1 and 2. `env` is 0 (inherit ours) or a
+/// block of NAME=value strings each ending in a NUL. No flags are defined yet. `pgid` is 0 (join our
+/// process group), 1 (start a new group) or an existing group to join.
+fn sys_spawn2(req_ptr: u64) -> i64 {
+    let raw = match copy_from_user(req_ptr, 80) {
+        Ok(raw) => raw,
+        Err(e) => return e,
+    };
+    let word = |i: usize| u64::from_le_bytes(raw[8 * i..8 * i + 8].try_into().unwrap());
+    let (path, argv, argv_len, argc) = (word(0), word(1), word(2), word(3));
+    let (fds_ptr, nfds, env_ptr, env_len, flags, pgid) = (word(4), word(5), word(6), word(7), word(8), word(9));
+    if flags != 0 {
+        return EINVAL;
+    }
+    let mut mapping = alloc::vec::Vec::new();
+    if nfds == 0 {
+        mapping.extend_from_slice(&[(0usize, 0u64), (1, 1), (2, 2)]);
+    } else {
+        if nfds > 16 {
+            return EINVAL;
+        }
+        let pairs = match copy_from_user(fds_ptr, nfds * 16) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        for i in 0..nfds as usize {
+            let child = u64::from_le_bytes(pairs[16 * i..16 * i + 8].try_into().unwrap());
+            let parent = u64::from_le_bytes(pairs[16 * i + 8..16 * i + 16].try_into().unwrap());
+            if child >= crate::ipc::fd::MAX_FDS as u64 {
+                return EBADF;
+            }
+            mapping.push((child as usize, parent));
+        }
+    }
+    let env = if env_ptr == 0 {
+        None
+    } else {
+        if env_len as usize > proc::MAX_ENV_BYTES {
+            return E2BIG;
+        }
+        match copy_from_user(env_ptr, env_len) {
+            Ok(e) => Some(e),
+            Err(e) => return e,
+        }
+    };
+    spawn_common(path, argv, argv_len, argc, &mapping, env, pgid)
+}
+
+fn spawn_common(
+    path_ptr: u64,
+    argv_ptr: u64,
+    argv_len: u64,
+    argc: u64,
+    mapping: &[(usize, u64)],
+    env: Option<alloc::vec::Vec<u8>>,
+    pgid: u64,
+) -> i64 {
     let path = match user_path(path_ptr) {
         Ok(p) => p,
         Err(e) => return e,
@@ -523,32 +626,25 @@ fn sys_spawn(path_ptr: u64, argv_ptr: u64, argv_len: u64, argc: u64, stdio_ptr: 
     {
         return EINVAL;
     }
-
-    // Which of our descriptors become the child's stdin, stdout and stderr.
-    let mapping: [u64; 3] = if stdio_ptr == 0 {
-        [0, 1, 2]
-    } else {
-        match copy_from_user(stdio_ptr, 24) {
-            Ok(raw) => {
-                let word = |i: usize| u64::from_le_bytes(raw[8 * i..8 * i + 8].try_into().unwrap());
-                [word(0), word(1), word(2)]
-            }
-            Err(e) => return e,
+    if let Some(env) = &env {
+        if !env.is_empty() && env.last() != Some(&0) {
+            return EINVAL;
         }
-    };
+    }
+
+    // Which of our descriptors the child gets, and under which numbers.
     let parent_fds = match proc::current_fds() {
         Some(fds) => fds,
         None => return EBADF,
     };
-    let files = {
-        let table = parent_fds.lock();
-        [table.get(mapping[0]), table.get(mapping[1]), table.get(mapping[2])]
-    };
     let mut child_fds = crate::ipc::fd::FdTable::empty();
-    for (i, file) in files.into_iter().enumerate() {
-        match file {
-            Some(file) => child_fds.share(i, file),
-            None => return EBADF,
+    {
+        let table = parent_fds.lock();
+        for &(child, parent) in mapping {
+            match table.get(parent) {
+                Some(file) => child_fds.share(child, file),
+                None => return EBADF,
+            }
         }
     }
 
@@ -556,12 +652,17 @@ fn sys_spawn(path_ptr: u64, argv_ptr: u64, argv_len: u64, argc: u64, stdio_ptr: 
         Some(cwd) => cwd.lock().clone(),
         None => return EBADF,
     };
+    // Our environment, unless the caller gave the child one.
+    let env = match env {
+        Some(e) => e,
+        None => sched::with_current_user(|u| u.env.to_vec()).unwrap_or_default(),
+    };
     let image = match vfs::read_file(&path, cwd.ino, 4 << 20) {
         Ok(image) => image,
         Err(e) => return e,
     };
     let name = path.rsplit('/').next().unwrap_or("proc");
-    match proc::spawn_user_in(name, &image, 0, child_fds, cwd, &argv, argc as usize) {
+    match proc::spawn_user_env(name, &image, 0, child_fds, cwd, &argv, argc as usize, &env, pgid) {
         Ok(handle) => {
             let pid = handle.pid as i64;
             proc::register_child(handle);
@@ -574,9 +675,89 @@ fn sys_spawn(path_ptr: u64, argv_ptr: u64, argv_len: u64, argc: u64, stdio_ptr: 
 }
 
 fn sys_waitpid(pid: u64) -> i64 {
-    match proc::take_child(pid) {
-        Some(handle) => proc::wait_forever(&handle),
-        None => ECHILD,
+    match proc::wait_child(Some(pid), false) {
+        Ok(Some((_, status))) => status,
+        Ok(None) => 0, // interrupted by a signal that ends us; the value is never seen
+        Err(e) => e,
+    }
+}
+
+/// kill(pid, sig): a positive pid is one process; a negative one (as a signed number) is a whole
+/// process group; 0 means the foreground group (the one Control-C goes to).
+fn sys_kill(pid: u64, sig: u64) -> i64 {
+    let Ok(sig) = u32::try_from(sig) else { return EINVAL };
+    let result = match pid as i64 {
+        0 => match console::foreground() {
+            0 => Err(proc::ESRCH),
+            group => proc::send_signal_group(group, sig),
+        },
+        p if p < 0 => proc::send_signal_group(p.unsigned_abs(), sig),
+        p => proc::send_signal(p as u64, sig),
+    };
+    match result {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+/// wait(pid, flags, out): wait for a child to finish. `pid` is a child's id, or u64::MAX for any
+/// child; flag 1 (WNOHANG) returns 0 at once if none has finished. Stores the exit status as an i64
+/// at `out` (if not 0) and returns the child's id; ECHILD if there is nothing to wait for.
+fn sys_wait(pid: u64, flags: u64, out: u64) -> i64 {
+    if flags & !1 != 0 {
+        return EINVAL;
+    }
+    if out != 0 {
+        if let Err(e) = walk_user(out, 8, true, |_, _| {}) {
+            return e;
+        }
+    }
+    let want = if pid == u64::MAX { None } else { Some(pid) };
+    match proc::wait_child(want, flags & 1 != 0) {
+        Ok(Some((child, status))) => {
+            if out != 0 {
+                let _ = copy_to_user(out, &status.to_le_bytes());
+            }
+            child as i64
+        }
+        Ok(None) => 0,
+        Err(e) => e,
+    }
+}
+
+/// proclist(buf, max): fill up to `max` 64-byte records, return how many. Layout:
+/// pid u32, ppid u32, state u32 (0 running or ready, 1 waiting, 2 finished but not waited for),
+/// pending-signals u32, start tick u64, cpu ticks u64, memory pages u64, exit status i64, name[16].
+fn sys_proclist(buf: u64, max: u64) -> i64 {
+    if max == 0 || max > 256 {
+        return EINVAL;
+    }
+    let procs = proc::all_processes();
+    let n = procs.len().min(max as usize);
+    let mut raw = alloc::vec![0u8; n * 64];
+    for (i, p) in procs.iter().take(n).enumerate() {
+        let rec = &mut raw[i * 64..(i + 1) * 64];
+        let state: u32 = if p.is_done() {
+            2
+        } else {
+            let tid = p.thread.load(core::sync::atomic::Ordering::Acquire);
+            (tid != usize::MAX && sched::is_waiting(tid)) as u32
+        };
+        rec[0..4].copy_from_slice(&(p.pid as u32).to_le_bytes());
+        rec[4..8].copy_from_slice(&(p.ppid as u32).to_le_bytes());
+        rec[8..12].copy_from_slice(&state.to_le_bytes());
+        rec[12..16].copy_from_slice(&p.pending.load(core::sync::atomic::Ordering::Relaxed).to_le_bytes());
+        rec[16..24].copy_from_slice(&p.start_tick.to_le_bytes());
+        rec[24..32].copy_from_slice(&p.cpu_ticks.load(core::sync::atomic::Ordering::Relaxed).to_le_bytes());
+        let pages = p.mem.upgrade().map_or(0, |m| m.pages());
+        rec[32..40].copy_from_slice(&pages.to_le_bytes());
+        rec[40..48].copy_from_slice(&p.exit_code().unwrap_or(0).to_le_bytes());
+        let name = p.name.as_bytes();
+        rec[48..48 + name.len().min(16)].copy_from_slice(&name[..name.len().min(16)]);
+    }
+    match copy_to_user(buf, &raw) {
+        Ok(()) => n as i64,
+        Err(e) => e,
     }
 }
 

@@ -61,6 +61,56 @@ impl WaitQueue {
         met
     }
 
+
+    /// Like `wait_until`, but gives up (returning false) when the calling process has been sent
+    /// a signal that is going to end it. Callers must tolerate an early return: the process is
+    /// finished off as its system call ends, so whatever they return is never looked at.
+    /// Kernel threads are never interrupted.
+    pub fn wait_until_intr(&self, mut cond: impl FnMut() -> bool) -> bool {
+        let flags = irq_save();
+        let me = sched::current_id();
+        let met = loop {
+            if cond() {
+                break true;
+            }
+            if crate::proc::fatal_signal_pending() {
+                break false;
+            }
+            self.waiters.lock().push_back(me);
+            sched::block_current(None);
+            let mut waiters = self.waiters.lock();
+            waiters.retain(|&id| id != me);
+            if waiters.is_empty() {
+                waiters.shrink_to_fit();
+            }
+        };
+        irq_restore(flags);
+        met
+    }
+
+    /// `wait_until_deadline` that a fatal signal also ends (see `wait_until_intr`).
+    pub fn wait_until_deadline_intr(&self, deadline: u64, mut cond: impl FnMut() -> bool) -> bool {
+        let flags = irq_save();
+        let me = sched::current_id();
+        let met = loop {
+            if cond() {
+                break true;
+            }
+            if timer::ticks() >= deadline || crate::proc::fatal_signal_pending() {
+                break false;
+            }
+            self.waiters.lock().push_back(me);
+            sched::block_current(Some(deadline));
+            let mut waiters = self.waiters.lock();
+            waiters.retain(|&id| id != me);
+            if waiters.is_empty() {
+                waiters.shrink_to_fit();
+            }
+        };
+        irq_restore(flags);
+        met
+    }
+
     /// Wake the longest-waiting thread, if any. Safe in interrupt handlers.
     pub fn wake_one(&self) -> bool {
         loop {

@@ -122,3 +122,39 @@ finish() {
     fi
     LAST_OUTPUT=$(cmd_output)
 }
+
+# ---- typing raw keystrokes (to test the line editor) ----------------------------------------------
+#   run_raw "keys" [expected...]   send the bytes exactly as given (end them with $'\r'), wait for the
+#                                  shell's next prompt, check the output like `run`
+#   send "bytes"                   send bytes without waiting for anything
+run_raw() {
+    local keys=$1
+    shift
+    local seen before output expected failed_before=$failures label
+    label=$(printf '%q' "$keys")
+    seen=$(prompt_count)
+    before=$(stat -c %s "$log")
+    printf '%s' "$keys" >&3
+    if ! wait_for_prompts $((seen + 1)) "${CMD_TIMEOUT:-30}"; then
+        fail "keys $label: the shell never came back"
+        tail -5 "$log"
+        echo "TEST FAILED: $failures problem(s); stopped at the first hang"
+        exit 1
+    fi
+    output=$(tail -c +$((before + 1)) "$log" | tr -d '\r')
+    LAST_OUTPUT=$output
+    for expected in "$@"; do
+        if [[ "$expected" == "~"* ]]; then
+            echo "$output" | grep -aEq -- "${expected#\~}" || fail "keys $label: no line matching /${expected#\~}/"
+        else
+            echo "$output" | grep -axF -- "$expected" >/dev/null || fail "keys $label: missing line '$expected'"
+        fi
+    done
+    if [ "$failures" -ne "$failed_before" ]; then
+        echo "---- output of keys $label:"
+        echo "$output" | tail -${SHOW_OUTPUT:-25} | sed 's/^/  | /'
+        echo "----"
+    fi
+}
+
+send() { printf '%s' "$1" >&3; }

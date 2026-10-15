@@ -838,12 +838,12 @@ fn corrupted_and_misaddressed_frames_are_dropped() {
     let mut other_host = good.clone();
     other_host[0..6].copy_from_slice(&[2, 7, 7, 7, 7, 7]); // not our MAC
     p.b.receive(&other_host, 0);
-    let mut other_ip = good.clone();
-    other_ip[14 + 16 + 3] = 99; // a different destination IP (checksum fixed below)
-    other_ip[14 + 10] = 0;
-    other_ip[14 + 11] = 0;
-    let c = checksum(&other_ip[14..34]);
-    other_ip[14 + 10..14 + 12].copy_from_slice(&c.to_be_bytes());
+    // A packet that is perfectly valid at every layer (right checksums) but addressed to
+    // another host on the wire to our MAC: it must be dropped for that reason alone.
+    let other_dst = [10, 0, 0, 99];
+    let udp = build_udp(IP_A, other_dst, 4000, port, b"data");
+    let ip = build_ipv4(IP_A, other_dst, PROTO_UDP, 9, 64, &udp);
+    let other_ip = build_eth(MAC_B, MAC_A, ETHERTYPE_IPV4, &ip);
     p.b.receive(&other_ip, 0);
     assert_eq!(p.b.stats.rx_dropped - before, 4);
     assert_eq!(p.b.udp_pending(port), 0);

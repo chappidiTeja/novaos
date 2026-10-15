@@ -4,6 +4,9 @@
 resolver = "2"
 members = [
     "abi",
+    "heap",
+    "shell",
+    "regex",
     "lib",
     "gfx",
     "wm",
@@ -30,6 +33,10 @@ members = [
     "httpd",
     "nc",
     "cksum",
+    "ps",
+    "kill",
+    "sleep",
+    "printenv",
 ]
 
 [profile.release]

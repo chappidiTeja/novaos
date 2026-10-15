@@ -5,6 +5,7 @@
 //!   '\n'  start of the next line (the grid scrolls when it is already on the last)
 //!   '\r'  back to the start of the line
 //!   0x08  one column left (stops at the left edge)
+//!   0x0C  clear the grid and go to the top left corner
 //!   '\t'  spaces up to the next multiple of 8 columns
 //!   printable ASCII is stored at the cursor, which moves right and wraps to a
 //!   new line when it passes the last column; every other byte is ignored.
@@ -60,6 +61,12 @@ impl<const COLS: usize, const ROWS: usize> TextGrid<COLS, ROWS> {
             b'\n' => self.newline(),
             b'\r' => self.col = 0,
             0x08 => self.col = self.col.saturating_sub(1),
+            // Form feed: clear everything and go back to the top left.
+            0x0C => {
+                self.cells = [[0; COLS]; ROWS];
+                self.row = 0;
+                self.col = 0;
+            }
             b'\t' => {
                 let next = (self.col / 8 + 1) * 8;
                 while self.col < next.min(COLS) {
@@ -140,6 +147,17 @@ mod tests {
         assert_eq!(text(&g), ["abcde", "", ""]);
         g.feed(b'f');
         assert_eq!(text(&g), ["abcde", "f", ""]);
+    }
+
+    #[test]
+    fn form_feed_clears_the_grid_and_homes_the_cursor() {
+        let mut g = TextGrid::<6, 3>::new();
+        g.feed_all(b"one\ntwo\nthree");
+        g.feed(0x0C);
+        assert_eq!(text(&g), ["", "", ""]);
+        assert_eq!(g.cursor(), (0, 0));
+        g.feed_all(b"new");
+        assert_eq!(text(&g), ["new", "", ""]);
     }
 
     #[test]

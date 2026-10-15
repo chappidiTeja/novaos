@@ -106,6 +106,11 @@ pub struct UserMem {
 }
 
 impl UserMem {
+    /// Pages of heap and shared memory in use (for the process list).
+    pub fn pages(&self) -> u64 {
+        self.heap_pages.load(Ordering::Relaxed) + self.shm_pages.load(Ordering::Relaxed)
+    }
+
     pub fn new() -> UserMem {
         UserMem {
             heap_next: AtomicU64::new(HEAP_BASE),
@@ -358,12 +363,14 @@ pub fn next_window_event(pid: u64, id: u32, timeout_ticks: Option<u64>) -> Resul
         None => false,
     };
     match timeout_ticks {
-        None => window.readable.wait_until(&mut take),
+        None => {
+            window.readable.wait_until_intr(&mut take);
+        }
         Some(0) => {
             take();
         }
         Some(ticks) => {
-            window.readable.wait_until_deadline(timer::ticks() + ticks, &mut take);
+            window.readable.wait_until_deadline_intr(timer::ticks() + ticks, &mut take);
         }
     }
     Ok(got)

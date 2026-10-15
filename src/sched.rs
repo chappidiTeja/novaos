@@ -189,6 +189,20 @@ impl Sched {
         }
     }
 
+    /// Make a Blocked or Sleeping thread ready (a signal arrived for its process). False if it
+    /// was not waiting.
+    fn kick(&mut self, id: usize) -> bool {
+        match self.threads.get_mut(id) {
+            Some(Some(thread)) if matches!(thread.state, State::Blocked | State::Sleeping) => {
+                thread.state = State::Ready;
+                self.sleeping.retain(|&s| s != id);
+                self.ready.push_back(id);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Choose the next thread, or None if the current thread keeps running.
     fn pick_next(&mut self) -> Option<Switch> {
         let old = self.current;
@@ -350,6 +364,10 @@ pub fn on_tick() {
             }
         }
         s.slice_left = s.slice_left.saturating_sub(1);
+        let running = s.current;
+        if let Some(user) = s.thread(running).user.as_ref() {
+            user.handle.cpu_ticks.fetch_add(1, Ordering::Relaxed);
+        }
         if s.current == s.idle {
             !s.ready.is_empty()
         } else {
@@ -371,6 +389,12 @@ pub fn yield_now() {
 /// Block the calling thread for at least `ticks` timer ticks (minimum 1).
 pub fn sleep_ticks(ticks: u64) {
     let flags = irq_save();
+    // A process that has been sent a fatal signal does not go to sleep (checked with interrupts
+    // off, so the signal cannot slip in between the check and the sleep).
+    if crate::proc::fatal_signal_pending() {
+        irq_restore(flags);
+        return;
+    }
     SCHED.with(|s| {
         let id = s.current;
         assert!(id != s.idle, "the idle thread cannot sleep");
@@ -409,6 +433,17 @@ pub fn block_current(deadline: Option<u64>) {
 /// handlers. Returns false if the thread was not blocked.
 pub fn wake(id: usize) -> bool {
     SCHED.with(|s| s.wake(id))
+}
+
+/// Wake a thread that is waiting (blocked or sleeping), whatever it waits for. Used to deliver
+/// signals; the thread finds out why it was woken by checking its process.
+pub fn kick(id: usize) -> bool {
+    SCHED.with(|s| s.kick(id))
+}
+
+/// Is the thread waiting for something (blocked or sleeping)? For the process list.
+pub fn is_waiting(id: usize) -> bool {
+    SCHED.with(|s| matches!(s.threads.get(id), Some(Some(t)) if matches!(t.state, State::Blocked | State::Sleeping)))
 }
 
 pub fn sleep_ms(ms: u64) {
@@ -543,3 +578,5 @@ pub fn self_test() {
         context_switches()
     );
 }
+
+

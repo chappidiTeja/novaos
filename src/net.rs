@@ -21,6 +21,7 @@ use novanet::tcp::{Tcp, TcpError};
 use novanet::{Config, NetError, Stack};
 
 pub const EIO: i64 = -5;
+pub const EINTR: i64 = -4;
 pub const EAGAIN: i64 = -11;
 pub const EMSGSIZE: i64 = -90;
 pub const EADDRINUSE: i64 = -98;
@@ -66,6 +67,11 @@ pub fn map_error(e: NetError) -> i64 {
         NetError::NoPorts => EADDRNOTAVAIL,
         NetError::NotBound => EINVAL,
     }
+}
+
+/// A signal that will end this process is waiting: stop waiting for the network.
+fn interrupted() -> bool {
+    crate::proc::fatal_signal_pending()
 }
 
 fn fmt_ip(ip: Ip) -> String {
@@ -188,7 +194,7 @@ pub fn config() -> Option<Config> {
 fn wait_activity(seen: u64, deadline: Option<u64>) {
     let soonest = timer::ticks() + 2;
     let until = deadline.map_or(soonest, |d| d.min(soonest));
-    EVENT.wait_until_deadline(until, || ACTIVITY.load(Ordering::SeqCst) != seen);
+    EVENT.wait_until_deadline_intr(until, || ACTIVITY.load(Ordering::SeqCst) != seen);
 }
 
 fn deadline_of(timeout_ticks: Option<u64>) -> Option<u64> {
@@ -258,6 +264,9 @@ impl UdpSocket {
         let port = self.ensure_bound()?;
         let deadline = deadline_of(timeout_ticks);
         loop {
+            if interrupted() {
+                return Err(EINTR);
+            }
             let seen = ACTIVITY.load(Ordering::SeqCst);
             let got = with_stack(|s, _| s.udp_recv(port)).ok_or(ENETDOWN)?;
             if let Some(d) = got {
@@ -373,6 +382,9 @@ impl TcpSocket {
         let TcpPhase::Listening { port } = self.phase() else { return Err(EINVAL) };
         let deadline = deadline_of(timeout_ticks);
         loop {
+            if interrupted() {
+                return Err(EINTR);
+            }
             let seen = ACTIVITY.load(Ordering::SeqCst);
             let got = with_tcp(|t, _| t.accept(port).map(|id| (id, t.peer(id)))).ok_or(ENETDOWN)?;
             if let Some((id, Some((ip, peer_port)))) = got {
@@ -399,6 +411,9 @@ impl TcpSocket {
         *self.phase.lock() = TcpPhase::Connected { id };
         let deadline = deadline_of(timeout_ticks);
         loop {
+            if interrupted() {
+                return Err(EINTR);
+            }
             let seen = ACTIVITY.load(Ordering::SeqCst);
             match with_tcp(|t, _| t.connect_result(id)).ok_or(ENETDOWN)? {
                 Ok(true) => return Ok(()),
@@ -430,6 +445,9 @@ impl TcpSocket {
         let id = self.id()?;
         let mut done = 0;
         while done < data.len() {
+            if interrupted() {
+                return Err(EINTR);
+            }
             let seen = ACTIVITY.load(Ordering::SeqCst);
             match with_tcp(|t, now| t.send(id, &data[done..], now)).ok_or(ENETDOWN)? {
                 Ok(n) => done += n,
@@ -449,6 +467,9 @@ impl TcpSocket {
         let deadline = deadline_of(timeout_ticks);
         let mut buf = alloc::vec![0u8; max];
         loop {
+            if interrupted() {
+                return Err(EINTR);
+            }
             let seen = ACTIVITY.load(Ordering::SeqCst);
             match with_tcp(|t, now| t.recv(id, &mut buf, now)).ok_or(ENETDOWN)? {
                 Ok(n) => {
@@ -524,6 +545,9 @@ pub fn ping(dst: Ip, payload_len: usize, timeout_ticks: u64) -> Result<u64, i64>
     let t0 = timer::now_us();
     with_stack(|s, now| s.ping_send(dst, id, seq, &data, now)).ok_or(ENETDOWN)?.map_err(map_error)?;
     loop {
+        if interrupted() {
+            return Err(EINTR);
+        }
         let seen = ACTIVITY.load(Ordering::SeqCst);
         let got = with_stack(|s, _| s.ping_take(id, seq)).ok_or(ENETDOWN)?;
         if got.is_some() {
@@ -577,6 +601,9 @@ pub fn resolve(name: &str, server: Option<(Ip, u16)>, timeout_ticks: u64) -> Res
     let deadline = deadline_of(Some(timeout_ticks));
     let mut next_send = 0u64;
     loop {
+        if interrupted() {
+            return Err(EINTR);
+        }
         let seen = ACTIVITY.load(Ordering::SeqCst);
         if timer::ticks() >= next_send {
             next_send = timer::ticks() + 100;

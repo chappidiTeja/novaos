@@ -87,13 +87,25 @@ fn main(_args: &Args) -> i32 {
         let mut event = Event::default();
         if win_event(id, &mut event, 1) == 1 {
             match event.kind {
-                EV_WIN_KEY => {
-                    // An escape would make the shell wait for the rest of a sequence
+                EV_WIN_KEY => match event.a {
+                    // A lone escape would make the shell wait for the rest of a sequence
                     // that never comes, so it is not passed on.
-                    if event.a != 27 {
-                        write(shell_in_write, &[event.a as u8]);
+                    27 => {}
+                    // Control-C stops the command the shell is running (if it is running
+                    // one; at an empty prompt the shell gets the key itself).
+                    3 => {
+                        if kill(0, SIGINT) < 0 {
+                            write(shell_in_write, &[3]);
+                        }
                     }
-                }
+                    // Arrows, Home, End, Delete...: the escape sequences a terminal sends.
+                    code if code >= 0x100 => {
+                        write(shell_in_write, key_escape(code));
+                    }
+                    code => {
+                        write(shell_in_write, &[code as u8]);
+                    }
+                },
                 EV_WIN_CLOSE => break,
                 _ => {}
             }

@@ -149,6 +149,132 @@ impl core::fmt::Display for Ip4 {
     }
 }
 
+
+// ---- signals, keys and processes -------------------------------------------------------------
+
+pub const SIGHUP: u32 = 1;
+pub const SIGINT: u32 = 2;
+pub const SIGQUIT: u32 = 3;
+pub const SIGKILL: u32 = 9;
+pub const SIGUSR1: u32 = 10;
+pub const SIGUSR2: u32 = 12;
+pub const SIGALRM: u32 = 14;
+pub const SIGTERM: u32 = 15;
+
+/// Exit status of a process ended by signal `n`: `-(SIGNALED_BASE + n)`.
+pub const SIGNALED_BASE: i64 = 2000;
+/// Exit status of a process ended by a CPU exception: `-(KILLED_BASE + vector)`.
+pub const KILLED_BASE: i64 = 1000;
+
+/// The signal that ended a process, if its exit status says it was a signal.
+pub fn signal_of(status: i64) -> Option<u32> {
+    let n = -status - SIGNALED_BASE;
+    if (1..32).contains(&n) {
+        Some(n as u32)
+    } else {
+        None
+    }
+}
+
+/// The name a person would type for a signal ("INT", "KILL"...).
+pub fn signal_name(sig: u32) -> &'static str {
+    match sig {
+        SIGHUP => "HUP",
+        SIGINT => "INT",
+        SIGQUIT => "QUIT",
+        SIGKILL => "KILL",
+        SIGUSR1 => "USR1",
+        SIGUSR2 => "USR2",
+        SIGALRM => "ALRM",
+        SIGTERM => "TERM",
+        _ => "?",
+    }
+}
+
+/// The signal for a name like "TERM" or "SIGTERM" (case-insensitive) or a number.
+pub fn signal_from_name(s: &str) -> Option<u32> {
+    let s = s.strip_prefix("SIG").or_else(|| s.strip_prefix("sig")).unwrap_or(s);
+    if let Some(n) = s.bytes().all(|b| b.is_ascii_digit()).then(|| s.bytes().fold(0u32, |v, b| v * 10 + (b - b'0') as u32)) {
+        return if s.is_empty() || n > 31 { None } else { Some(n) };
+    }
+    [SIGHUP, SIGINT, SIGQUIT, SIGKILL, SIGUSR1, SIGUSR2, SIGALRM, SIGTERM]
+        .into_iter()
+        .find(|&sig| signal_name(sig).eq_ignore_ascii_case(s))
+}
+
+/// Keys without an ASCII character arrive as these codes (keyboard events to the desktop).
+pub const KEY_UP: i32 = 0x101;
+pub const KEY_DOWN: i32 = 0x102;
+pub const KEY_RIGHT: i32 = 0x103;
+pub const KEY_LEFT: i32 = 0x104;
+pub const KEY_HOME: i32 = 0x105;
+pub const KEY_END: i32 = 0x106;
+pub const KEY_DELETE: i32 = 0x107;
+pub const KEY_PAGE_UP: i32 = 0x108;
+pub const KEY_PAGE_DOWN: i32 = 0x109;
+pub const KEY_INSERT: i32 = 0x10A;
+
+/// What a text terminal receives for a special key (the kernel's console sends the same).
+pub fn key_escape(code: i32) -> &'static [u8] {
+    match code {
+        KEY_UP => b"\x1b[A",
+        KEY_DOWN => b"\x1b[B",
+        KEY_RIGHT => b"\x1b[C",
+        KEY_LEFT => b"\x1b[D",
+        KEY_HOME => b"\x1b[H",
+        KEY_END => b"\x1b[F",
+        KEY_DELETE => b"\x1b[3~",
+        KEY_PAGE_UP => b"\x1b[5~",
+        KEY_PAGE_DOWN => b"\x1b[6~",
+        KEY_INSERT => b"\x1b[2~",
+        _ => b"",
+    }
+}
+
+pub const PROC_RUNNING: u32 = 0;
+pub const PROC_WAITING: u32 = 1;
+pub const PROC_ZOMBIE: u32 = 2;
+
+/// One entry of `proclist` (64 bytes).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ProcInfo {
+    pub pid: u32,
+    pub ppid: u32,
+    /// PROC_RUNNING (running or ready), PROC_WAITING (blocked or sleeping), PROC_ZOMBIE (finished,
+    /// not waited for).
+    pub state: u32,
+    pub pending_signals: u32,
+    /// Timer tick (100 per second) at which the process started.
+    pub start_tick: u64,
+    /// Timer ticks it has spent running.
+    pub cpu_ticks: u64,
+    /// Pages of heap and shared memory.
+    pub mem_pages: u64,
+    /// Exit status (meaningful for zombies).
+    pub exit_status: i64,
+    pub name: [u8; 16],
+}
+
+impl ProcInfo {
+    pub const EMPTY: ProcInfo = ProcInfo {
+        pid: 0,
+        ppid: 0,
+        state: 0,
+        pending_signals: 0,
+        start_tick: 0,
+        cpu_ticks: 0,
+        mem_pages: 0,
+        exit_status: 0,
+        name: [0; 16],
+    };
+
+    pub fn name(&self) -> &str {
+        let len = self.name.iter().position(|&b| b == 0).unwrap_or(16);
+        core::str::from_utf8(&self.name[..len]).unwrap_or("?")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,5 +360,54 @@ mod net_tests {
                 Ok(())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod proc_tests {
+    use super::*;
+    use core::mem::{offset_of, size_of};
+
+    #[test]
+    fn proc_info_layout_matches_the_kernel() {
+        assert_eq!(size_of::<ProcInfo>(), 64);
+        assert_eq!(offset_of!(ProcInfo, ppid), 4);
+        assert_eq!(offset_of!(ProcInfo, state), 8);
+        assert_eq!(offset_of!(ProcInfo, pending_signals), 12);
+        assert_eq!(offset_of!(ProcInfo, start_tick), 16);
+        assert_eq!(offset_of!(ProcInfo, cpu_ticks), 24);
+        assert_eq!(offset_of!(ProcInfo, mem_pages), 32);
+        assert_eq!(offset_of!(ProcInfo, exit_status), 40);
+        assert_eq!(offset_of!(ProcInfo, name), 48);
+    }
+
+    #[test]
+    fn signal_status_roundtrip() {
+        for sig in [SIGHUP, SIGINT, SIGKILL, SIGTERM] {
+            assert_eq!(signal_of(-(SIGNALED_BASE + sig as i64)), Some(sig));
+        }
+        assert_eq!(signal_of(0), None);
+        assert_eq!(signal_of(1), None);
+        assert_eq!(signal_of(-(KILLED_BASE + 14)), None, "a CPU exception is not a signal");
+        assert_eq!(signal_of(-(SIGNALED_BASE + 40)), None);
+    }
+
+    #[test]
+    fn signal_names_parse() {
+        assert_eq!(signal_from_name("TERM"), Some(SIGTERM));
+        assert_eq!(signal_from_name("SIGKILL"), Some(SIGKILL));
+        assert_eq!(signal_from_name("int"), Some(SIGINT));
+        assert_eq!(signal_from_name("9"), Some(9));
+        assert_eq!(signal_from_name("0"), Some(0));
+        assert_eq!(signal_from_name("99"), None);
+        assert_eq!(signal_from_name(""), None);
+        assert_eq!(signal_from_name("BOGUS"), None);
+    }
+
+    #[test]
+    fn key_escape_sequences_are_the_usual_ones() {
+        assert_eq!(key_escape(KEY_UP), b"\x1b[A");
+        assert_eq!(key_escape(KEY_DELETE), b"\x1b[3~");
+        assert_eq!(key_escape(b'a' as i32), b"");
     }
 }

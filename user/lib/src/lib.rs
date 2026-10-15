@@ -363,6 +363,80 @@ pub fn win_flush(id: u32) -> i64 {
     unsafe { syscall(SYS_WIN_FLUSH, id as u64, 0, 0, 0, 0) }
 }
 
+pub const SYS_SPAWN2: u64 = 51;
+
+/// Start the program at `path` (NUL-terminated). `argv` is `argc` NUL-terminated strings back to
+/// back. `fds` lists `[child descriptor, our descriptor]` pairs: the child gets those of our
+/// descriptors under those numbers (an empty list means our 0, 1 and 2). `env` is the child's
+/// environment (NAME=value strings each ending in a NUL), or None to pass ours on. `pgid` is 0 to
+/// stay in our process group, 1 to start a new one, or the id of a group to join.
+/// Returns the new process id, or a negative error.
+pub fn spawn_ex(path: &[u8], argv: &[u8], argc: usize, fds: &[[u64; 2]], env: Option<&[u8]>, pgid: u64) -> i64 {
+    let req: [u64; 10] = [
+        path.as_ptr() as u64,
+        argv.as_ptr() as u64,
+        argv.len() as u64,
+        argc as u64,
+        fds.as_ptr() as u64,
+        fds.len() as u64,
+        env.map_or(0, |e| e.as_ptr() as u64),
+        env.map_or(0, |e| e.len() as u64),
+        0,
+        pgid,
+    ];
+    unsafe { syscall(SYS_SPAWN2, req.as_ptr() as u64, 0, 0, 0, 0) }
+}
+
+pub const SYS_WAIT: u64 = 53;
+pub const WNOHANG: u64 = 1;
+
+/// Wait for a child to finish: `pid` is a child's id or `ANY_CHILD`. Returns the child's id and
+/// stores its exit status in `status`; with WNOHANG returns 0 if none has finished; ECHILD
+/// (-10) if there is no such child.
+pub fn wait(pid: u64, flags: u64, status: &mut i64) -> i64 {
+    unsafe { syscall(SYS_WAIT, pid, flags, status as *mut i64 as u64, 0, 0) }
+}
+
+pub const ANY_CHILD: u64 = u64::MAX;
+
+/// Send `sig` to every process in group `pgid`.
+pub fn kill_group(pgid: u64, sig: u32) -> i64 {
+    unsafe { syscall(SYS_KILL, (-(pgid as i64)) as u64, sig as u64, 0, 0, 0) }
+}
+
+// ---- signals and processes ---------------------------------------------------------------------
+
+pub const SYS_KILL: u64 = 46;
+pub const SYS_SIGIGNORE: u64 = 47;
+pub const SYS_SETFG: u64 = 48;
+pub const SYS_PROCLIST: u64 = 49;
+pub const SYS_GETPPID: u64 = 50;
+
+/// Send signal `sig` to process `pid`. pid 0 means the foreground process (where Control-C
+/// goes). Signal 0 only checks that the process exists.
+pub fn kill(pid: u64, sig: u32) -> i64 {
+    unsafe { syscall(SYS_KILL, pid, sig as u64, 0, 0, 0) }
+}
+
+/// Ignore the signals whose bits are set in `mask` (bit n = signal n; SIGKILL cannot be ignored).
+pub fn sigignore(mask: u32) {
+    unsafe { syscall(SYS_SIGIGNORE, mask as u64, 0, 0, 0, 0) };
+}
+
+/// Make `pid` the foreground process: Control-C on the console signals it. 0 = nobody.
+pub fn setfg(pid: u64) {
+    unsafe { syscall(SYS_SETFG, pid, 0, 0, 0, 0) };
+}
+
+/// Fill `list` with the processes that exist; returns how many were stored.
+pub fn proclist(list: &mut [ProcInfo]) -> i64 {
+    unsafe { syscall(SYS_PROCLIST, list.as_mut_ptr() as u64, list.len() as u64, 0, 0, 0) }
+}
+
+pub fn getppid() -> u64 {
+    unsafe { syscall(SYS_GETPPID, 0, 0, 0, 0, 0) as u64 }
+}
+
 // ---- networking ------------------------------------------------------------------------------
 
 pub const SYS_SOCKET: u64 = 32;
@@ -468,6 +542,8 @@ pub fn strerror(code: i64) -> &'static str {
         -16 => "Device or resource busy",
         -19 => "No such device",
         -2 => "No such file or directory",
+        -3 => "No such process",
+        -4 => "Interrupted system call",
         -5 => "I/O error",
         -9 => "Bad file descriptor",
         -10 => "No child processes",
@@ -570,12 +646,38 @@ macro_rules! eprintln {
 pub struct Args {
     argc: usize,
     argv: *const u8,
+    env: *const u8,
+    env_len: usize,
 }
 
 impl Args {
     #[doc(hidden)]
-    pub fn new(argc: usize, argv: *const u8) -> Args {
-        Args { argc, argv }
+    pub fn new(argc: usize, argv: *const u8, env: *const u8, env_len: usize) -> Args {
+        Args { argc, argv, env, env_len }
+    }
+
+    /// The environment as "NAME=value" strings.
+    pub fn env(&self) -> impl Iterator<Item = &'static str> + '_ {
+        let block: &'static [u8] = if self.env.is_null() || self.env_len == 0 {
+            &[]
+        } else {
+            unsafe { core::slice::from_raw_parts(self.env, self.env_len) }
+        };
+        block.split(|&b| b == 0).filter(|s| !s.is_empty()).filter_map(|s| core::str::from_utf8(s).ok())
+    }
+
+    /// The value of environment variable `name`.
+    pub fn getenv(&self, name: &str) -> Option<&'static str> {
+        self.env().find_map(|kv| kv.strip_prefix(name).and_then(|rest| rest.strip_prefix('=')))
+    }
+
+    /// The whole environment block (strings back to back, each ending in a NUL).
+    pub fn env_block(&self) -> &'static [u8] {
+        if self.env.is_null() || self.env_len == 0 {
+            &[]
+        } else {
+            unsafe { core::slice::from_raw_parts(self.env, self.env_len) }
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -620,8 +722,8 @@ impl Args {
 macro_rules! entry {
     ($main:path) => {
         #[no_mangle]
-        pub extern "C" fn _start(argc: usize, argv: *const u8) -> ! {
-            let args = $crate::Args::new(argc, argv);
+        pub extern "C" fn _start(argc: usize, argv: *const u8, env: *const u8, env_len: usize) -> ! {
+            let args = $crate::Args::new(argc, argv, env, env_len);
             let code: i32 = $main(&args);
             $crate::exit(code as i64)
         }
@@ -707,3 +809,59 @@ impl<const N: usize> fmt::Write for CString<N> {
         }
     }
 }
+
+// ---- the heap (opt-in: `nova = { ..., features = ["heap"] }` + `extern crate alloc;`) ----------
+
+#[cfg(feature = "heap")]
+mod heap_glue {
+    use super::mem_alloc;
+    use core::alloc::{GlobalAlloc, Layout};
+    use core::cell::UnsafeCell;
+    use novaheap::{Heap, PageSource};
+
+    /// Pages from the kernel (`mem_alloc`); they stay with the process until it exits.
+    struct Pages;
+
+    impl PageSource for Pages {
+        fn get(&mut self, pages: usize) -> Option<*mut u8> {
+            let r = mem_alloc(pages as u64);
+            if r < 0 {
+                None
+            } else {
+                Some(r as *mut u8)
+            }
+        }
+    }
+
+    struct Global(UnsafeCell<Heap<Pages>>);
+
+    // A NovaOS process has a single thread, so nothing can race on the heap.
+    unsafe impl Sync for Global {}
+
+    unsafe impl GlobalAlloc for Global {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            (*self.0.get()).alloc(layout)
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            (*self.0.get()).dealloc(ptr, layout)
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            (*self.0.get()).realloc(ptr, layout, new_size)
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: Global = Global(UnsafeCell::new(Heap::new(Pages)));
+
+    /// Bytes currently allocated / obtained from the kernel, for programs that report them.
+    pub fn heap_used() -> usize {
+        unsafe { (*ALLOCATOR.0.get()).used() }
+    }
+
+    pub fn heap_total() -> usize {
+        unsafe { (*ALLOCATOR.0.get()).total() }
+    }
+}
+
+#[cfg(feature = "heap")]
+pub use heap_glue::{heap_total, heap_used};

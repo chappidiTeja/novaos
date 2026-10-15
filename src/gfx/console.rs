@@ -200,6 +200,16 @@ impl Console {
             b'\n' => self.newline(),
             b'\r' => self.col = 0,
             0x08 => self.col = self.col.saturating_sub(1),
+            // Form feed: clear the screen and start again at the top left (`clear` sends it).
+            0x0C => {
+                self.cells.fill(0);
+                self.row = 0;
+                self.col = 0;
+                if self.visible {
+                    let (w, h) = (self.fb.width, self.fb.height);
+                    self.fb.fill_rect(0, 0, w, h, BACKGROUND);
+                }
+            }
             b'\t' => {
                 let next = (self.col / TAB + 1) * TAB;
                 while self.col < next.min(self.cols) {
