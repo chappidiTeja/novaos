@@ -7,7 +7,7 @@ DESKTOP_ISO := novaos-desktop.iso
 USER_OUT  := user/target/x86_64-unknown-none/release
 USER_ELF  := build/hello.elf
 # Programs that go to /bin on the disk. `hello` is also embedded in the kernel for its tests.
-USER_BINS := hello sh ls cat echo mkdir rm rmdir touch wc cp gfxtest desktop term gdemo ifconfig ping nslookup nettest fetch httpd nc cksum ps kill sleep printenv
+USER_BINS := hello sh ls cat echo mkdir rm rmdir touch wc grep cp gfxtest desktop term gdemo ifconfig ping nslookup nettest fetch httpd nc cksum ps kill sleep printenv
 MKFS      := tools/mkfs/target/x86_64-unknown-linux-gnu/release/mkfs
 DISK      := build/disk.img
 

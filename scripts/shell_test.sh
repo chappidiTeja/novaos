@@ -181,6 +181,28 @@ run "echo )"                          "sh: syntax error: unexpected ')'"
 run "fi"                              "sh: syntax error: unexpected 'fi'"
 run "echo \$((1/0))"                  "sh: arithmetic: division by zero" "0"
 
+# ---- grep ------------------------------------------------------------------------------------------------------------------------
+run "echo 'apple pie' > /tmp/g1; echo 'Banana split' >> /tmp/g1; echo 'cherry tart' >> /tmp/g1; echo 'apple 42' >> /tmp/g1"
+run "grep apple /tmp/g1"              "apple pie" "apple 42"
+run_absent "grep apple /tmp/g1"       "cherry tart"
+run "grep -n apple /tmp/g1"           "1:apple pie" "4:apple 42"
+run "grep -c apple /tmp/g1"           "2"
+run "grep -v apple /tmp/g1"           "Banana split" "cherry tart"
+run_absent "grep -v apple /tmp/g1"    "apple pie"
+run "grep banana /tmp/g1; echo status \$?"  "status 1"
+run "grep -i banana /tmp/g1"          "Banana split"
+run "grep '^c.*t\$' /tmp/g1"          "cherry tart"
+run "grep '[0-9][0-9]' /tmp/g1"       "apple 42"
+run "grep -E 'pie|tart' /tmp/g1"      "apple pie" "cherry tart"
+run "grep 'pie|tart' /tmp/g1"         "apple pie" "cherry tart"
+run "cat /tmp/g1 | grep split"        "Banana split"
+run "grep -l apple /tmp/g1"           "/tmp/g1"
+run "grep apple /tmp/g1 /tmp/g1"      "/tmp/g1:apple pie"
+run "grep '[' /tmp/g1; echo status \$?"  "~bad pattern" "status 2"
+run "grep apple /tmp/nonexistent; echo status \$?"  "status 2"
+run "echo 'x y' > /tmp/g2; grep -r 'x y' /tmp"  "/tmp/g2:x y"
+run "rm /tmp/g1 /tmp/g2"
+
 # ---- the line editor ----------------------------------------------------------------------------------------------------------------
 run_raw $'echo abx\x7fc\r'            "abc"                       # backspace
 run_raw $'echo ac\x1b[Db\r'           "abc"                       # left arrow, insert
